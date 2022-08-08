@@ -431,20 +431,39 @@ impl<'a> CredentialsStore<'a> {
             password: password.into(),
         }
     }
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self, ip: Option<IpAddr>) -> Vec<u8> {
+        let mut v = Vec::with_capacity(
+            1 + ip.map_or(0, |ip| if ip.is_ipv4() { 4 } else { 16 })
+                + 8
+                + self.username.len()
+                + self.password.len(),
+        );
+        if let Some(ip) = ip {
+            let ident = if ip.is_ipv4() { 0x1 } else { 0x2 };
+            v.push(ident);
+            v.extend_from_slice(IpBytes::from(ip).as_ref());
+        } else {
+            v.push(0)
+        }
         let len = (self.username.len() as u64).to_le_bytes();
-        let mut v = Vec::with_capacity(8 + self.username.len() + self.password.len());
         v.extend_from_slice(&len);
         v.extend_from_slice(self.username.as_bytes());
         v.extend_from_slice(self.password.as_bytes());
         v
     }
-    pub fn from_bytes(mut b: &'a [u8]) -> Result<Self, ()> {
+    pub fn from_bytes(mut b: &'a [u8]) -> Result<(Self, Option<&'a [u8]>), ()> {
         (|| {
             let mut take_n = |n: usize| {
                 let v = b.get(..n)?;
                 b = &b[n..];
                 Some(v)
+            };
+            let ip_type = take_n(1)?;
+            let ip = match ip_type[0] {
+                0x0 => None,
+                0x1 => Some(take_n(4)?),
+                0x2 => Some(take_n(16)?),
+                _ => return None,
             };
             let len = take_n(8)?;
             let mut array = [0; 8];
@@ -452,7 +471,7 @@ impl<'a> CredentialsStore<'a> {
             let len = u64::from_le_bytes(array);
             let username = std::str::from_utf8(take_n(len as usize)?).ok()?;
             let password = std::str::from_utf8(b).ok()?;
-            Some(Self { username, password })
+            Some((Self { username, password }, ip))
         })()
         .ok_or(())
     }
@@ -754,7 +773,6 @@ pub struct Config<
     jwt_validity: Duration,
     credentials_cookie_validity: Duration,
     cookie_path: String,
-    // `TODO`: also make credentials cookie dependant on IP (add ip data at end before encrypting)
     // `TODO`: log out (just send set-cookie headers)
 
     // `TODO`: implement ECDSA
@@ -990,9 +1008,16 @@ impl<
                             d
                         }
                     );
-                    let credentials = some_or_remove_cookie_307!(
+                    let (credentials, credentials_ip) = some_or_remove_cookie_307!(
                         CredentialsStore::from_bytes(&decrypted).ok()
                     );
+
+                    if let Some (ip) = credentials_ip {
+                        // the IP addresses doesn't match
+                        if ip != IpBytes::from(addr.ip()).as_ref() {
+                            some_or_remove_cookie_307!(None);
+                        }
+                    }
 
                     let jwt =
                         jwt_from_credentials(credentials.username, credentials.password, addr, req)
@@ -1057,6 +1082,7 @@ impl<
             )
         });
         let config = self.clone();
+        let relogin_on_ip_change = config.relogin_on_ip_change;
         extensions.add_prepare_single(
             &config.auth_page_name,
             prepare!(
@@ -1065,8 +1091,9 @@ impl<
                 _path,
                 addr,
                 move |auth_jwt_from_credentials: JwtCreation,
-                signing_algo: Arc<ComputedAlgo>,
-                new_credentials_cookie: Box<dyn Fn(&str) -> String + Send + Sync>| {
+                      signing_algo: Arc<ComputedAlgo>,
+                      new_credentials_cookie: Box<dyn Fn(&str) -> String + Send + Sync>,
+                      relogin_on_ip_change: bool| {
                     macro_rules! some_or_return {
                         ($e: expr, $status: expr) => {
                             if let Some(v) = $e {
@@ -1107,10 +1134,15 @@ impl<
                     );
                     let (jwt_header, _jwt_value) = some_or_return!(
                         auth_jwt_from_credentials(username, password, addr, req).await,
-                        StatusCode::UNAUTHORIZED, "the credentials are invalid"
+                        StatusCode::UNAUTHORIZED,
+                        "the credentials are invalid"
                     );
                     let credentials = CredentialsStore::new(username, password);
-                    let credentials_bin = credentials.to_bytes();
+                    let credentials_bin = credentials.to_bytes(if *relogin_on_ip_change {
+                        Some(addr.ip())
+                    } else {
+                        None
+                    });
                     let encrypted = signing_algo
                         .public_key()
                         .encrypt(
@@ -1120,13 +1152,21 @@ impl<
                         )
                         .expect("failed to encrypt credentials with RSA");
                     let mut credentials_header = String::new();
-                    base64::encode_config_buf(&encrypted, base64::URL_SAFE_NO_PAD, &mut credentials_header);
+                    base64::encode_config_buf(
+                        &encrypted,
+                        base64::URL_SAFE_NO_PAD,
+                        &mut credentials_header,
+                    );
                     let credentials_header = new_credentials_cookie(&credentials_header);
                     FatResponse::no_cache(
-                        Response::builder().header("set-cookie", jwt_header)
-                        .header("set-cookie", credentials_header)
-                        .body(Bytes::new())
-                        .expect("JWT or credentials header contains invalid bytes for a header"))
+                        Response::builder()
+                            .header("set-cookie", jwt_header)
+                            .header("set-cookie", credentials_header)
+                            .body(Bytes::new())
+                            .expect(
+                                "JWT or credentials header contains invalid bytes for a header",
+                            ),
+                    )
                 }
             ),
         );
@@ -1140,12 +1180,22 @@ mod tests {
 
     static HEADER: &[u8] = r#"{"alg":"HS256"}"#.as_bytes();
 
+    fn test_computed_algo(secret: &[u8]) -> ComputedAlgo {
+        let pk = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 128).unwrap();
+        let pubk = rsa::RsaPublicKey::from(&pk);
+        ComputedAlgo::HmacSha256 {
+            secret: secret.to_vec(),
+            credentials_encryption_rsa_private_key: pk,
+            credentials_encryption_rsa_public_key: pubk,
+        }
+    }
+
     #[test]
     fn serde() {
         let mut map = HashMap::new();
         map.insert("loggedInAs".to_owned(), "admin".to_owned());
         let d = AuthData::Structured(map);
-        let token = d.into_jwt(b"secretkey", HEADER, 60, None);
+        let token = d.into_jwt(&test_computed_algo(b"secretkey"), HEADER, 60, None);
 
         let v = Validation::<HashMap<String, String>>::from_jwt(&token, b"secretkey", None);
         match v {
@@ -1163,7 +1213,7 @@ mod tests {
         map.insert("loggedInAs".to_owned(), "admin".to_owned());
         let d = AuthData::Structured(map);
         // eyJhbGciOiJIUzI1NiJ9.eyJfX3ZhcmlhbnQiOiJzIiwiZXhwIjoxNjU5NDc3MjA4LCJpYXQiOjE2NTk0NzcxNDgsImxvZ2dlZEluQXMiOiJhZG1pbiJ9.p4V5nMMHYbri-na4aEPJzVIMb2U1XhEH9RmL8Hurra4
-        let _token = d.into_jwt(b"secretkey", HEADER, 60, None);
+        let _token = d.into_jwt(&test_computed_algo(b"secretkey"), HEADER, 60, None);
 
         // changed `loggedInAs` to `superuser`
         let tampered_token = "eyJhbGciOiJIUzI1NiJ9.eyJfX3ZhcmlhbnQiOiJzIiwiZXhwIjoxNjU5NDc3MjA4LCJpYXQiOjE2NTk0NzcxNDgsImxvZ2dlZEluQXMiOiJzdXBlcnVzZXIifQ.p4V5nMMHYbri-na4aEPJzVIMb2U1XhEH9RmL8Hurra4";
@@ -1179,12 +1229,17 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("loggedInAs".to_owned(), "user".to_owned());
         let d = AuthData::Structured(map);
-        let _token = d.into_jwt(b"secretkey", HEADER, 60, None);
+        let _token = d.into_jwt(&test_computed_algo(b"secretkey"), HEADER, 60, None);
 
         let mut map = HashMap::new();
         map.insert("loggedInAs".to_owned(), "admin".to_owned());
         let d = AuthData::Structured(map);
-        let tampered_token = d.into_jwt(b"the hacker's secret", HEADER, 60, None);
+        let tampered_token = d.into_jwt(
+            &test_computed_algo(b"the hacker's secret"),
+            HEADER,
+            60,
+            None,
+        );
 
         let v =
             Validation::<HashMap<String, String>>::from_jwt(&tampered_token, b"secretkey", None);
