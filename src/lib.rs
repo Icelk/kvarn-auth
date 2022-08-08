@@ -2,7 +2,7 @@
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use hmac::{Hmac, Mac};
@@ -184,9 +184,23 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         }
         s
     }
-    // static HEADER: &[u8] = r#"{"alg":"HS256"}"#.as_bytes();
-    // static HEADER: &[u8] = r#"{"alg":"RS256"}"#.as_bytes();
-    // fn into_jwt_with_default_header()
+    /// # Panics
+    ///
+    /// See [`Self::into_jwt`].
+    fn into_jwt_with_default_header(
+        self,
+        signing_algo: &ComputedAlgo,
+        seconds_before_expiry: u64,
+        ip: Option<IpAddr>,
+    ) -> String {
+        static HS_HEADER: &[u8] = r#"{"alg":"HS256"}"#.as_bytes();
+        static RS_HEADER: &[u8] = r#"{"alg":"RS256"}"#.as_bytes();
+        let header = match signing_algo {
+            ComputedAlgo::HmacSha256 { .. } => HS_HEADER,
+            ComputedAlgo::RSASha256 { .. } => RS_HEADER,
+        };
+        self.into_jwt(signing_algo, header, seconds_before_expiry, ip)
+    }
 }
 pub enum Validation<T: Serialize + DeserializeOwned> {
     /// This can come from multiple sources, including but not limited to:
@@ -529,6 +543,10 @@ pub struct Builder {
     relogin_on_ip_change: Option<bool>,
     jwt_cookie_name: Option<String>,
     credentials_cookie_name: Option<String>,
+    show_auth_page_when_unauthorized: Option<String>,
+    jwt_cookie_validity: Option<Duration>,
+    credentials_cookie_validity: Option<Duration>,
+    cookie_path: Option<String>,
 }
 impl Builder {
     pub fn new() -> Self {
@@ -556,19 +574,123 @@ impl Builder {
         self
     }
     /// Sets the name of the JWT cookie. This is the cookie that authorizes the user.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `jwt_cookie_name` contains illegal bytes for a header value.
     pub fn with_jwt_cookie_name(mut self, jwt_cookie_name: impl Into<String>) -> Self {
-        self.jwt_cookie_name = Some(jwt_cookie_name.into());
+        let s = jwt_cookie_name.into();
+        if !s
+            .bytes()
+            .all(kvarn::prelude::utils::is_valid_header_value_byte)
+        {
+            panic!("jwt_cookie_name contains illegal bytes")
+        }
+        self.jwt_cookie_name = Some(s);
         self
     }
     /// Sets the name of the credentials cookie. This is the cookie that stores the user's
     /// credentials to allow renewal of the JWT cookie without requiring the user to input
     /// credentials. It is encrypted with the server's PK.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `credentials_cookie_name` contains illegal bytes for a header value.
     pub fn with_credentials_cookie_name(
         mut self,
         credentials_cookie_name: impl Into<String>,
     ) -> Self {
-        self.credentials_cookie_name = Some(credentials_cookie_name.into());
+        let s = credentials_cookie_name.into();
+        if !s
+            .bytes()
+            .all(kvarn::prelude::utils::is_valid_header_value_byte)
+        {
+            panic!("jwt_cookie_name contains illegal bytes")
+        }
+        self.credentials_cookie_name = Some(s);
         self
+    }
+    /// Sets the path of all the cookies. Set this to avoid slowing down other pages on your
+    /// server, as Kvarn will try to renew the JWT on every page by default.
+    /// By setting this to only your protected pages, the JWT cookie is only sent there.
+    /// Kvarn thinks the user isn't logged in on other pages, reducing the work it has to do.
+    ///
+    /// This is also useful if you want to have multiple authentication systems on a single host.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cookie_path` contains illegal bytes for a header value.
+    pub fn with_cookie_path(mut self, cookie_path: impl Into<String>) -> Self {
+        let s = cookie_path.into();
+        if !s
+            .bytes()
+            .all(kvarn::prelude::utils::is_valid_header_value_byte)
+        {
+            panic!("cookie_path contains illegal bytes")
+        }
+        self.cookie_path = Some(s);
+        self
+    }
+    /// Show this page when the user isn't logged in.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `show_auth_page_when_unauthorized` cannot be converted into an
+    /// [`kvarn::prelude::Uri`].
+    pub fn with_show_auth_page_when_unauthorized(
+        mut self,
+        show_auth_page_when_unauthorized: impl Into<String>,
+    ) -> Self {
+        let s = show_auth_page_when_unauthorized.into();
+        if kvarn::prelude::Uri::try_from(&s).is_err() {
+            panic!("show_auth_page_when_unauthorized contains illegal bytes")
+        }
+        self.show_auth_page_when_unauthorized = Some(s);
+        self
+    }
+    /// Makes all JWTs valid for the duration of `valid_for`.
+    /// After that, the JWT is automatically refreshed from the securely stored credentials.
+    pub fn with_jwt_validity(mut self, valid_for: Duration) -> Self {
+        self.jwt_cookie_validity = Some(valid_for);
+        self
+    }
+    /// Makes the credentials cookie valid for the duration of `valid_for`.
+    /// If this is a year, the user doesn't have to relog in a year.
+    pub fn with_credentials_cookie_validity(mut self, valid_for: Duration) -> Self {
+        self.credentials_cookie_validity = Some(valid_for);
+        self
+    }
+
+    fn _build<
+        T: Serialize + DeserializeOwned + Send + Sync,
+        F: Fn(&str, &str, SocketAddr, &kvarn::FatRequest) -> Fut + Send + Sync,
+        Fut: Future<Output = Validation<T>> + Send + Sync,
+    >(
+        self,
+        is_allowed: F,
+        mode: Mode,
+    ) -> Arc<Config<T, F, Fut>> {
+        let c = Config {
+            mode,
+            is_allowed: Arc::new(is_allowed),
+            jwt_page_name_extension: self.jwt_page_name_extension,
+            auth_page_name: self.auth_page_name.unwrap_or_else(|| "/auth".into()),
+            samesite_strict: self.samesite_strict.unwrap_or(true),
+            relogin_on_ip_change: self.relogin_on_ip_change.unwrap_or(false),
+            jwt_cookie_name: self.jwt_cookie_name.unwrap_or_else(|| "auth-jwt".into()),
+            credentials_cookie_name: self
+                .credentials_cookie_name
+                .unwrap_or_else(|| "auth-credentials".into()),
+            show_auth_page_when_unauthorized: self.show_auth_page_when_unauthorized,
+            jwt_validity: self
+                .jwt_cookie_validity
+                .unwrap_or_else(|| Duration::from_secs(60 * 60)),
+            credentials_cookie_validity: self
+                .credentials_cookie_validity
+                .unwrap_or_else(|| Duration::from_secs(60 * 60 * 24 * 365)),
+            cookie_path: self.cookie_path.unwrap_or_else(|| String::from("/")),
+        };
+        Arc::new(c)
     }
     pub fn build<
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -579,19 +701,7 @@ impl Builder {
         is_allowed: F,
         pk: CryptoAlgo,
     ) -> Arc<Config<T, F, Fut>> {
-        let c = Config {
-            mode: Mode::Sign(Arc::new(pk.into())),
-            is_allowed: Arc::new(is_allowed),
-            jwt_page_name_extension: self.jwt_page_name_extension,
-            auth_page_name: self.auth_page_name.unwrap_or_else(|| "/auth".into()),
-            samesite_strict: self.samesite_strict.unwrap_or(true),
-            relogin_on_ip_change: self.relogin_on_ip_change.unwrap_or(false),
-            jwt_cookie_name: self.jwt_cookie_name.unwrap_or_else(|| "auth-jwt".into()),
-            credentials_cookie_name: self
-                .credentials_cookie_name
-                .unwrap_or_else(|| "auth-credentials".into()),
-        };
-        Arc::new(c)
+        self._build(is_allowed, Mode::Sign(Arc::new(pk.into())))
     }
     #[allow(clippy::type_complexity)]
     pub fn build_validate(
@@ -618,19 +728,10 @@ impl Builder {
             SocketAddr,
             &kvarn::FatRequest,
         ) -> core::future::Pending<Validation<()>> = _placeholder;
-        let c = Config {
-            mode: Mode::Validate(Arc::new(ValidationAlgo::RSASha256 { public_key })),
-            is_allowed: Arc::new(placeholder),
-            jwt_page_name_extension: self.jwt_page_name_extension,
-            auth_page_name: self.auth_page_name.unwrap_or_else(|| "/auth".into()),
-            samesite_strict: self.samesite_strict.unwrap_or(true),
-            relogin_on_ip_change: self.relogin_on_ip_change.unwrap_or(false),
-            jwt_cookie_name: self.jwt_cookie_name.unwrap_or_else(|| "auth-jwt".into()),
-            credentials_cookie_name: self
-                .credentials_cookie_name
-                .unwrap_or_else(|| "auth-credentials".into()),
-        };
-        Arc::new(c)
+        self._build(
+            placeholder,
+            Mode::Validate(Arc::new(ValidationAlgo::RSASha256 { public_key })),
+        )
     }
 }
 pub type LoginStatusClosure<T> = Arc<
@@ -649,13 +750,12 @@ pub struct Config<
     relogin_on_ip_change: bool,
     jwt_cookie_name: String,
     credentials_cookie_name: String,
-    // `TODO`: add option to use a prime extension to show the auth page when needing to log in to
-    // see a resource
-    // `TODO`: add JWT valid duration
-    // `TODO`: add credentials valid duration
+    show_auth_page_when_unauthorized: Option<String>,
+    jwt_validity: Duration,
+    credentials_cookie_validity: Duration,
+    cookie_path: String,
     // `TODO`: also make credentials cookie dependant on IP (add ip data at end before encrypting)
-    // `TODO`: make JWT cookie expire so we don't have to check it
-    // `TODO`: option for cookie path (so it doesn't get sent for every path!)
+    // `TODO`: log out (just send set-cookie headers)
 
     // `TODO`: implement ECDSA
     // https://datatracker.ietf.org/doc/html/rfc7518#section-3.4
@@ -742,6 +842,7 @@ impl<
         };
 
         let config = self.clone();
+        let show_auth_page_when_unauthorized = config.show_auth_page_when_unauthorized.clone();
         let prime_signing_algo = signing_algo.clone();
         let validate = move |req: &FatRequest, addr: SocketAddr| {
             let jwt_cookie = get_cookie(req, &config.jwt_cookie_name);
@@ -764,15 +865,22 @@ impl<
             Box::new(validate);
 
         extensions.add_prime(
-            prime!(req, _host, addr, move |validate: Box<
-                dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync,
-            >| {
-                let state: AuthState = validate(req, addr);
-                match state {
-                    AuthState::Authorized | AuthState::Missing => None,
-                    AuthState::Incorrect => Some(Uri::from_static("/./jwt-auth-refresh-token")),
+            prime!(
+                req,
+                _host,
+                addr,
+                move |validate: Box<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync>,
+                      show_auth_page_when_unauthorized: Option<String>| {
+                    let state: AuthState = validate(req, addr);
+                    match state {
+                        AuthState::Authorized => None,
+                        AuthState::Missing => show_auth_page_when_unauthorized
+                            .as_ref()
+                            .map(|path| Uri::try_from(path).expect("invalid bytes in auth path")),
+                        AuthState::Incorrect => Some(Uri::from_static("/./jwt-auth-refresh-token")),
+                    }
                 }
-            }),
+            ),
             extensions::Id::new(8432, "auth JWT renewal").no_override(),
         );
         let refresh_signing_algo = signing_algo.clone();
@@ -791,17 +899,22 @@ impl<
                         match data {
                             Validation::Unauthorized => None,
                             Validation::Authorized(data) => {
-                                let jwt =
-                                    data.into_jwt(&signing_algo, b"", 60, config.ip(addr.ip()));
+                                let jwt = data.into_jwt_with_default_header(
+                                    &signing_algo,
+                                    config.jwt_validity.as_secs(),
+                                    config.ip(addr.ip()),
+                                );
                                 let header_value = format!(
-                                    "{}={}; Secure; HttpOnly; SameSite={}; Path=/",
+                                    "{}={}; Secure; HttpOnly; SameSite={}; Path={}; MaxAge={}",
                                     config.jwt_cookie_name,
                                     jwt,
                                     if config.samesite_strict {
                                         "Strict"
                                     } else {
                                         "Lax"
-                                    }
+                                    },
+                                    config.cookie_path,
+                                    config.jwt_validity.as_secs(),
                                 );
                                 Some((header_value, jwt))
                             }
@@ -903,8 +1016,6 @@ impl<
                         }
                     }
 
-                    println!("new JWT: {jwt:?}\n Req: {:#?}", req.headers());
-
                     let encoding = req.headers_mut().remove("accept-encoding");
                     utils::replace_header_static(req.headers_mut(), "accept-encoding", "identity");
 
@@ -933,14 +1044,16 @@ impl<
         let config = self.clone();
         let new_credentials_cookie = Box::new(move |contents: &str| {
             format!(
-                "{}={}; Secure; HttpOnly; SameSite={}; Path=/",
+                "{}={}; Secure; HttpOnly; SameSite={}; Path={}, MaxAge={}",
                 config.credentials_cookie_name,
                 contents,
                 if config.samesite_strict {
                     "Strict"
                 } else {
                     "Lax"
-                }
+                },
+                config.cookie_path,
+                config.credentials_cookie_validity.as_secs(),
             )
         });
         let config = self.clone();
