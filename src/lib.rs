@@ -923,7 +923,7 @@ impl<
                                     config.ip(addr.ip()),
                                 );
                                 let header_value = format!(
-                                    "{}={}; Secure; HttpOnly; SameSite={}; Path={}; MaxAge={}",
+                                    "{}={}; Secure; HttpOnly; SameSite={}; Max-Age={}; Path={}",
                                     config.jwt_cookie_name,
                                     jwt,
                                     if config.samesite_strict {
@@ -931,8 +931,8 @@ impl<
                                     } else {
                                         "Lax"
                                     },
-                                    config.cookie_path,
                                     config.jwt_validity.as_secs(),
+                                    config.cookie_path,
                                 );
                                 Some((header_value, jwt))
                             }
@@ -942,134 +942,236 @@ impl<
                 Box::pin(fut)
             },
         );
-        let auth_jwt_from_credentials = Arc::clone(&jwt_from_credentials);
-        extensions.add_prepare_single(
-            "/./jwt-auth-refresh-token",
-            prepare!(
-                req,
-                host,
-                _,
-                addr,
-                move |credentials_cookie_name: String,
-                      jwt_cookie_name: String,
-                      refresh_signing_algo: Arc<ComputedAlgo>,
-                      jwt_from_credentials: JwtCreation| {
-                    macro_rules! some_or_remove_cookie_307 {
-                        ($e: expr) => {
-                            if let Some(v) = $e {
-                                v
-                            } else {
-                                let remove_cookie =
-                                    format!(r#"{credentials_cookie_name}=""; Expires=1"#);
-                                let encoding =  req.headers_mut().remove("accept-encoding");
-                                utils::replace_header_static(req.headers_mut(), "accept-encoding", "identity");
 
-                                let mut response = kvarn::handle_cache(req, addr, host).await;
-                                response.response.headers_mut().insert(
+        let auth_jwt_from_credentials = Arc::clone(&jwt_from_credentials);
+        let cookie_path = self.cookie_path.clone();
+        let prepare_extension = prepare!(
+            req,
+            host,
+            _,
+            addr,
+            move |credentials_cookie_name: String,
+                  jwt_cookie_name: String,
+                  cookie_path: String,
+                  refresh_signing_algo: Arc<ComputedAlgo>,
+                  jwt_from_credentials: JwtCreation| {
+                macro_rules! some_or_remove_cookie {
+                    ($e: expr) => {
+                        if let Some(v) = $e {
+                            v
+                        } else {
+                            let remove_cookie = format!(
+                                "{credentials_cookie_name}=\"\"; \
+                                Path={cookie_path}; \
+                                Max-Age=1"
+                            );
+                            let remove_jwt_cookie = format!(
+                                "{jwt_cookie_name}=\"\"; \
+                                Path={cookie_path}; \
+                                Max-Age=1"
+                            );
+                            let do_remove_credentials = get_cookie(req, credentials_cookie_name)
+                                .map(extract_cookie_value)
+                                .map_or(false, |v| !v.is_empty());
+                            let do_remove_jwt = get_cookie(req, jwt_cookie_name)
+                                .map(extract_cookie_value)
+                                .map_or(false, |v| !v.is_empty());
+                            let encoding = req.headers_mut().remove("accept-encoding");
+                            utils::replace_header_static(
+                                req.headers_mut(),
+                                "accept-encoding",
+                                "identity",
+                            );
+
+                            if let Some((cookie, pos, header_pos)) =
+                                get_cookie_with_header_pos(req, credentials_cookie_name)
+                            {
+                                let value_start = pos - credentials_cookie_name.len() - 1;
+                                let value_end = cookie[value_start..]
+                                    .find("; ")
+                                    .map(|v| v + 2)
+                                    .unwrap_or_else(|| cookie.len() - value_start)
+                                    + value_start;
+                                let mut new_cookie_header = cookie.to_owned();
+                                new_cookie_header.drain(value_start..value_end);
+                                let header_to_change = req.headers_mut().entry("cookie");
+                                if let header::Entry::Occupied(mut entry) = header_to_change {
+                                    let header_to_change =
+                                        entry.iter_mut().nth(header_pos).unwrap();
+                                    *header_to_change = HeaderValue::from_str(&new_cookie_header)
+                                        .expect("unreachable, as we just removed bytes");
+                                } else {
+                                    unreachable!(
+                                        "The header must be present, \
+                                        since we got the data from it \
+                                        in the previous call"
+                                    );
+                                }
+                            }
+                            if let Some((cookie, pos, header_pos)) =
+                                get_cookie_with_header_pos(req, jwt_cookie_name)
+                            {
+                                let value_start = pos - jwt_cookie_name.len() - 1;
+                                let value_end = cookie[value_start..]
+                                    .find("; ")
+                                    .map(|v| v + 2)
+                                    .unwrap_or_else(|| cookie.len() - value_start)
+                                    + value_start;
+                                let mut new_cookie_header = cookie.to_owned();
+                                new_cookie_header.drain(value_start..value_end);
+                                let header_to_change = req.headers_mut().entry("cookie");
+                                if let header::Entry::Occupied(mut entry) = header_to_change {
+                                    let header_to_change =
+                                        entry.iter_mut().nth(header_pos).unwrap();
+                                    *header_to_change = HeaderValue::from_str(&new_cookie_header)
+                                        .expect("unreachable, as we just removed bytes");
+                                } else {
+                                    unreachable!(
+                                        "The header must be present, \
+                                        since we got the data from it \
+                                        in the previous call"
+                                    );
+                                }
+                            }
+
+                            let mut response = kvarn::handle_cache(req, addr, host).await;
+
+                            if do_remove_credentials {
+                                response.response.headers_mut().append(
                                     "set-cookie",
                                     HeaderValue::from_str(&remove_cookie)
                                         .expect("credentials_cookie_name contains illegal bytes"),
                                 );
-                                if let Some(encoding) = encoding {
-                                    utils::replace_header(req.headers_mut(), "accept-encoding", encoding);
-                                }
-
-                                let mut fat_response = FatResponse::no_cache(response.response);
-                                if let Some(f) = response.future {
-                                    fat_response = fat_response.with_future(f);
-                                }
-                                return fat_response;
                             }
-                        };
-                    }
+                            if do_remove_jwt {
+                                response.response.headers_mut().append(
+                                    "set-cookie",
+                                    HeaderValue::from_str(&remove_jwt_cookie)
+                                        .expect("jwt_cookie_name contains illegal bytes"),
+                                );
+                            }
+                            if let Some(encoding) = encoding {
+                                utils::replace_header(
+                                    req.headers_mut(),
+                                    "accept-encoding",
+                                    encoding,
+                                );
+                            }
 
-                    let req: &mut FatRequest = req;
-
-                    let credentials_cookie = get_cookie(req, credentials_cookie_name);
-                    let credentials = some_or_remove_cookie_307!(
-                        credentials_cookie.map(extract_cookie_value)
-                    );
-                    let mut rsa_credentials = Vec::new();
-                    some_or_remove_cookie_307!(
-                        base64::decode_config_buf(
-                            credentials,
-                            base64::URL_SAFE_NO_PAD,
-                            &mut rsa_credentials,
-                        )
-                        .ok()                   );
-                    let key = refresh_signing_algo.private_key();
-                    #[allow(clippy::let_and_return)]
-                    let decrypted = some_or_remove_cookie_307!(
-                        {
-                            // this is needed for some weird Rust reason
-                            let d = key
-                                .decrypt(rsa::PaddingScheme::PKCS1v15Encrypt, &rsa_credentials)
-                                .ok();
-                            d
+                            let mut fat_response = FatResponse::no_cache(response.response);
+                            if let Some(f) = response.future {
+                                fat_response = fat_response.with_future(f);
+                            }
+                            return fat_response;
                         }
-                    );
-                    let (credentials, credentials_ip) = some_or_remove_cookie_307!(
-                        CredentialsStore::from_bytes(&decrypted).ok()
-                    );
+                    };
+                }
 
-                    if let Some (ip) = credentials_ip {
-                        // the IP addresses doesn't match
-                        if ip != IpBytes::from(addr.ip()).as_ref() {
-                            some_or_remove_cookie_307!(None);
-                        }
+                let req: &mut FatRequest = req;
+
+                let credentials_cookie = get_cookie(req, credentials_cookie_name);
+                let credentials =
+                    some_or_remove_cookie!(credentials_cookie.map(extract_cookie_value));
+                let mut rsa_credentials = Vec::new();
+                some_or_remove_cookie!(base64::decode_config_buf(
+                    credentials,
+                    base64::URL_SAFE_NO_PAD,
+                    &mut rsa_credentials,
+                )
+                .ok());
+                let key = refresh_signing_algo.private_key();
+                #[allow(clippy::let_and_return)]
+                let decrypted = some_or_remove_cookie!({
+                    // this is needed for some weird Rust reason
+                    let d = key
+                        .decrypt(rsa::PaddingScheme::PKCS1v15Encrypt, &rsa_credentials)
+                        .ok();
+                    d
+                });
+                let (credentials, credentials_ip) =
+                    some_or_remove_cookie!(CredentialsStore::from_bytes(&decrypted).ok());
+
+                if let Some(ip) = credentials_ip {
+                    // the IP addresses doesn't match
+                    if ip != IpBytes::from(addr.ip()).as_ref() {
+                        some_or_remove_cookie!(None);
                     }
+                }
 
-                    let jwt =
-                        jwt_from_credentials(credentials.username, credentials.password, addr, req)
-                            .await;
-                    let (jwt, jwt_value) = some_or_remove_cookie_307!(jwt);
+                let jwt =
+                    jwt_from_credentials(credentials.username, credentials.password, addr, req)
+                        .await;
+                let (jwt, jwt_value) = some_or_remove_cookie!(jwt);
 
-                    if let Some((cookie, pos, header_pos)) =
-                        get_cookie_with_header_pos(req, jwt_cookie_name)
-                    {
-                        let new_cookie_header =
-                            cookie.replace(extract_cookie_value((cookie, pos)), &jwt_value);
-                        let header_to_change = req.headers_mut().entry(
-                            "cookie"
+                if let Some((cookie, pos, header_pos)) =
+                    get_cookie_with_header_pos(req, jwt_cookie_name)
+                {
+                    let new_cookie_header =
+                        cookie.replace(extract_cookie_value((cookie, pos)), &jwt_value);
+                    let header_to_change = req.headers_mut().entry("cookie");
+                    if let header::Entry::Occupied(mut entry) = header_to_change {
+                        let header_to_change = entry.iter_mut().nth(header_pos).unwrap();
+                        *header_to_change = HeaderValue::from_str(&new_cookie_header)
+                            .expect("JWT refresh contains illegal bytes in the header");
+                    } else {
+                        unreachable!(
+                            "The header must be present, \
+                            since we got the data from it in the previous call"
                         );
-                        if let header::Entry::Occupied(mut entry) = header_to_change {
-                            let header_to_change = entry.iter_mut().nth(header_pos).unwrap();
-                            *header_to_change = HeaderValue::from_str(&new_cookie_header)
-                                .expect("JWT refresh contains illegal bytes in the header");
-                        }else {
-                            unreachable!("The header must be present, since we got the data from it in the previous call");
-                        }
                     }
-
-                    let encoding = req.headers_mut().remove("accept-encoding");
-                    utils::replace_header_static(req.headers_mut(), "accept-encoding", "identity");
-
-                    let mut response = kvarn::handle_cache(req, addr, host).await;
-                    response.response.headers_mut().insert(
-                        "set-cookie",
-                        HeaderValue::from_str(&jwt)
+                } else if let Some(h) = req.headers_mut().get_mut("cookie") {
+                    let mut new = BytesMut::with_capacity(
+                        h.as_bytes().len() + 2 + jwt_cookie_name.len() + 1 + jwt_value.len(),
+                    );
+                    new.extend_from_slice(h.as_bytes());
+                    new.extend_from_slice(b"; ");
+                    new.extend_from_slice(jwt_cookie_name.as_bytes());
+                    new.extend_from_slice(b"=");
+                    new.extend_from_slice(jwt_value.as_bytes());
+                    *h = HeaderValue::from_maybe_shared(new)
+                        .expect("JWT refresh contains illegal bytes in the header");
+                } else {
+                    let mut new =
+                        BytesMut::with_capacity(jwt_cookie_name.len() + 1 + jwt_value.len());
+                    new.extend_from_slice(jwt_cookie_name.as_bytes());
+                    new.extend_from_slice(b"=");
+                    new.extend_from_slice(jwt_value.as_bytes());
+                    req.headers_mut().insert(
+                        "cookie",
+                        HeaderValue::from_maybe_shared(new)
                             .expect("JWT refresh contains illegal bytes in the header"),
                     );
-
-                    if let Some(encoding) = encoding {
-                        utils::replace_header(req.headers_mut(), "accept-encoding", encoding);
-                    }
-
-                    let mut fat_response = FatResponse::no_cache(response.response);
-                    if let Some(f) = response.future {
-                        fat_response = fat_response.with_future(f);
-                    }
-                    fat_response
                 }
-            ),
+
+                let encoding = req.headers_mut().remove("accept-encoding");
+                utils::replace_header_static(req.headers_mut(), "accept-encoding", "identity");
+
+                let mut response = kvarn::handle_cache(req, addr, host).await;
+                response.response.headers_mut().append(
+                    "set-cookie",
+                    HeaderValue::from_str(&jwt)
+                        .expect("JWT refresh contains illegal bytes in the header"),
+                );
+
+                if let Some(encoding) = encoding {
+                    utils::replace_header(req.headers_mut(), "accept-encoding", encoding);
+                }
+
+                let mut fat_response = FatResponse::no_cache(response.response);
+                if let Some(f) = response.future {
+                    fat_response = fat_response.with_future(f);
+                }
+                fat_response
+            }
         );
+        extensions.add_prepare_single("/./jwt-auth-refresh-token", prepare_extension);
 
         // `/<auth-page-name>` to accept POST & PUT methods and the return a jwt and credentials
         // token. (use same jwt function as the other page)
         let config = self.clone();
         let new_credentials_cookie = Box::new(move |contents: &str| {
             format!(
-                "{}={}; Secure; HttpOnly; SameSite={}; Path={}, MaxAge={}",
+                "{}={}; Secure; HttpOnly; SameSite={}; Max-Age={}; Path={}",
                 config.credentials_cookie_name,
                 contents,
                 if config.samesite_strict {
@@ -1077,8 +1179,8 @@ impl<
                 } else {
                     "Lax"
                 },
-                config.cookie_path,
                 config.credentials_cookie_validity.as_secs(),
+                config.cookie_path,
             )
         });
         let config = self.clone();
