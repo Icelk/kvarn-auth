@@ -45,6 +45,48 @@ fn extract_cookie_value(d: (&str, usize)) -> &str {
     let s = &d.0[d.1..];
     s.split(';').next().unwrap_or(s)
 }
+fn remove_cookie(req: &mut kvarn::FatRequest, cookie_name: &str) -> bool {
+    use kvarn::prelude::*;
+    if let Some((cookie, pos, header_pos)) = get_cookie_with_header_pos(req, cookie_name) {
+        let value_start = pos - cookie_name.len() - 1;
+        let value_end = cookie[value_start..]
+            .find("; ")
+            .map(|v| v + 2)
+            .unwrap_or_else(|| cookie.len() - value_start)
+            + value_start;
+        let mut new_cookie_header = cookie.to_owned();
+        new_cookie_header.drain(value_start..value_end);
+        let header_to_change = req.headers_mut().entry("cookie");
+        if let header::Entry::Occupied(mut entry) = header_to_change {
+            let header_to_change = entry.iter_mut().nth(header_pos).unwrap();
+            *header_to_change = HeaderValue::from_str(&new_cookie_header)
+                .expect("unreachable, as we just removed bytes");
+        } else {
+            unreachable!(
+                "The header must be present, since we got the data from it in the previous call"
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
+fn remove_set_cookie(
+    response: &mut kvarn::prelude::Response<kvarn::prelude::Bytes>,
+    cookie_name: &str,
+    cookie_path: &str,
+) {
+    let remove_cookie = format!(
+        "{cookie_name}=\"\"; \
+        Path={cookie_path}; \
+        Max-Age=1"
+    );
+    response.headers_mut().append(
+        "set-cookie",
+        kvarn::prelude::HeaderValue::from_str(&remove_cookie)
+            .expect("a user-supplied cookie_name or the cookie_path contains illegal bytes for use in a header"),
+    );
+}
 pub enum AuthData<T: Serialize + DeserializeOwned = ()> {
     Text(String),
     Number(f64),
@@ -652,15 +694,18 @@ impl Builder {
     }
     /// Show this page when the user isn't logged in.
     ///
+    /// Please also specify [`Self::with_cookie_path`], as else `auth_page` will be shown instead
+    /// of every other page when not logged in.
+    ///
     /// # Panics
     ///
     /// Panics if `show_auth_page_when_unauthorized` cannot be converted into an
     /// [`kvarn::prelude::Uri`].
     pub fn with_show_auth_page_when_unauthorized(
         mut self,
-        show_auth_page_when_unauthorized: impl Into<String>,
+        auth_page: impl Into<String>,
     ) -> Self {
-        let s = show_auth_page_when_unauthorized.into();
+        let s = auth_page.into();
         if kvarn::prelude::Uri::try_from(&s).is_err() {
             panic!("show_auth_page_when_unauthorized contains illegal bytes")
         }
@@ -774,6 +819,7 @@ pub struct Config<
     credentials_cookie_validity: Duration,
     cookie_path: String,
     // `TODO`: log out (just send set-cookie headers)
+    // `TODO`: make clearing of cookies into a function
 
     // `TODO`: implement ECDSA
     // https://datatracker.ietf.org/doc/html/rfc7518#section-3.4
@@ -827,6 +873,15 @@ impl<
             },
         )
     }
+    /// Create an API route at [`Builder::auth_page_name`] and make the JWT token automatically
+    /// refresh.
+    ///
+    /// To log in, use JavaScript's `fetch` with method POST or PUT to the `auth_page_name`,
+    /// with the username on the first line and
+    /// the password on the second.
+    ///
+    /// To log out, `fetch` DELETE to `auth_page_name`.
+    ///
     /// # Panics
     ///
     /// Panics if this config was created using [`Builder::build_validate`].
@@ -861,6 +916,7 @@ impl<
 
         let config = self.clone();
         let show_auth_page_when_unauthorized = config.show_auth_page_when_unauthorized.clone();
+        let cookie_path = config.cookie_path.clone();
         let prime_signing_algo = signing_algo.clone();
         let validate = move |req: &FatRequest, addr: SocketAddr| {
             let jwt_cookie = get_cookie(req, &config.jwt_cookie_name);
@@ -888,13 +944,17 @@ impl<
                 _host,
                 addr,
                 move |validate: Box<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync>,
-                      show_auth_page_when_unauthorized: Option<String>| {
+                      show_auth_page_when_unauthorized: Option<String>,
+                      cookie_path: String| {
                     let state: AuthState = validate(req, addr);
                     match state {
                         AuthState::Authorized => None,
-                        AuthState::Missing => show_auth_page_when_unauthorized
-                            .as_ref()
-                            .map(|path| Uri::try_from(path).expect("invalid bytes in auth path")),
+                        AuthState::Missing if req.uri().path().starts_with(cookie_path) => {
+                            show_auth_page_when_unauthorized.as_ref().map(|path| {
+                                Uri::try_from(path).expect("invalid bytes in auth path")
+                            })
+                        }
+                        AuthState::Missing => None,
                         AuthState::Incorrect => Some(Uri::from_static("/./jwt-auth-refresh-token")),
                     }
                 }
@@ -960,16 +1020,6 @@ impl<
                         if let Some(v) = $e {
                             v
                         } else {
-                            let remove_cookie = format!(
-                                "{credentials_cookie_name}=\"\"; \
-                                Path={cookie_path}; \
-                                Max-Age=1"
-                            );
-                            let remove_jwt_cookie = format!(
-                                "{jwt_cookie_name}=\"\"; \
-                                Path={cookie_path}; \
-                                Max-Age=1"
-                            );
                             let do_remove_credentials = get_cookie(req, credentials_cookie_name)
                                 .map(extract_cookie_value)
                                 .map_or(false, |v| !v.is_empty());
@@ -983,71 +1033,23 @@ impl<
                                 "identity",
                             );
 
-                            if let Some((cookie, pos, header_pos)) =
-                                get_cookie_with_header_pos(req, credentials_cookie_name)
-                            {
-                                let value_start = pos - credentials_cookie_name.len() - 1;
-                                let value_end = cookie[value_start..]
-                                    .find("; ")
-                                    .map(|v| v + 2)
-                                    .unwrap_or_else(|| cookie.len() - value_start)
-                                    + value_start;
-                                let mut new_cookie_header = cookie.to_owned();
-                                new_cookie_header.drain(value_start..value_end);
-                                let header_to_change = req.headers_mut().entry("cookie");
-                                if let header::Entry::Occupied(mut entry) = header_to_change {
-                                    let header_to_change =
-                                        entry.iter_mut().nth(header_pos).unwrap();
-                                    *header_to_change = HeaderValue::from_str(&new_cookie_header)
-                                        .expect("unreachable, as we just removed bytes");
-                                } else {
-                                    unreachable!(
-                                        "The header must be present, \
-                                        since we got the data from it \
-                                        in the previous call"
-                                    );
-                                }
-                            }
-                            if let Some((cookie, pos, header_pos)) =
-                                get_cookie_with_header_pos(req, jwt_cookie_name)
-                            {
-                                let value_start = pos - jwt_cookie_name.len() - 1;
-                                let value_end = cookie[value_start..]
-                                    .find("; ")
-                                    .map(|v| v + 2)
-                                    .unwrap_or_else(|| cookie.len() - value_start)
-                                    + value_start;
-                                let mut new_cookie_header = cookie.to_owned();
-                                new_cookie_header.drain(value_start..value_end);
-                                let header_to_change = req.headers_mut().entry("cookie");
-                                if let header::Entry::Occupied(mut entry) = header_to_change {
-                                    let header_to_change =
-                                        entry.iter_mut().nth(header_pos).unwrap();
-                                    *header_to_change = HeaderValue::from_str(&new_cookie_header)
-                                        .expect("unreachable, as we just removed bytes");
-                                } else {
-                                    unreachable!(
-                                        "The header must be present, \
-                                        since we got the data from it \
-                                        in the previous call"
-                                    );
-                                }
-                            }
+                            remove_cookie(req, credentials_cookie_name);
+                            remove_cookie(req, jwt_cookie_name);
 
                             let mut response = kvarn::handle_cache(req, addr, host).await;
 
                             if do_remove_credentials {
-                                response.response.headers_mut().append(
-                                    "set-cookie",
-                                    HeaderValue::from_str(&remove_cookie)
-                                        .expect("credentials_cookie_name contains illegal bytes"),
+                                remove_set_cookie(
+                                    &mut response.response,
+                                    credentials_cookie_name,
+                                    cookie_path,
                                 );
                             }
                             if do_remove_jwt {
-                                response.response.headers_mut().append(
-                                    "set-cookie",
-                                    HeaderValue::from_str(&remove_jwt_cookie)
-                                        .expect("jwt_cookie_name contains illegal bytes"),
+                                remove_set_cookie(
+                                    &mut response.response,
+                                    jwt_cookie_name,
+                                    cookie_path,
                                 );
                             }
                             if let Some(encoding) = encoding {
@@ -1185,6 +1187,9 @@ impl<
         });
         let config = self.clone();
         let relogin_on_ip_change = config.relogin_on_ip_change;
+        let jwt_cookie_name = config.jwt_cookie_name.clone();
+        let credentials_cookie_name = config.credentials_cookie_name.clone();
+        let cookie_path = config.cookie_path.clone();
         extensions.add_prepare_single(
             &config.auth_page_name,
             prepare!(
@@ -1195,7 +1200,10 @@ impl<
                 move |auth_jwt_from_credentials: JwtCreation,
                       signing_algo: Arc<ComputedAlgo>,
                       new_credentials_cookie: Box<dyn Fn(&str) -> String + Send + Sync>,
-                      relogin_on_ip_change: bool| {
+                      relogin_on_ip_change: bool,
+                      credentials_cookie_name: String,
+                      jwt_cookie_name: String,
+                      cookie_path: String| {
                     macro_rules! some_or_return {
                         ($e: expr, $status: expr) => {
                             if let Some(v) = $e {
@@ -1217,6 +1225,26 @@ impl<
                             }
                         };
                     }
+
+                    match *req.method() {
+                        // continue with the normal control flow
+                        Method::POST | Method::PUT => {}
+                        Method::DELETE => {
+                            let mut response = Response::new(Bytes::new());
+                            remove_set_cookie(&mut response, jwt_cookie_name, cookie_path);
+                            remove_set_cookie(&mut response, credentials_cookie_name, cookie_path);
+                            return FatResponse::no_cache(response);
+                        }
+                        _ => {
+                            return default_error_response(
+                                StatusCode::METHOD_NOT_ALLOWED,
+                                host,
+                                Some("POST or PUT to log in, DELETE to log out"),
+                            )
+                            .await
+                        }
+                    }
+
                     let body = some_or_return!(
                         req.body_mut().read_to_bytes().await.ok(),
                         StatusCode::BAD_REQUEST
