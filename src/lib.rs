@@ -1227,15 +1227,10 @@ impl<
                     &mut rsa_credentials,
                 )
                 .ok());
-                println!("decode");
-                println!("{cookie_path}, {refresh_signing_algo:?}",);
-                println!("decrypt {}", String::from_utf8_lossy(&rsa_credentials));
                 let decrypted =
                     some_or_remove_cookie!(refresh_signing_algo.decrypt(&mut rsa_credentials));
-                println!("decrypted {}", String::from_utf8_lossy(&decrypted));
                 let (credentials, credentials_ip) =
                     some_or_remove_cookie!(CredentialsStore::from_bytes(&decrypted).ok());
-                println!("got credentials: {credentials:?}");
 
                 if let Some(ip) = credentials_ip {
                     // the IP addresses doesn't match
@@ -1243,13 +1238,11 @@ impl<
                         some_or_remove_cookie!(None);
                     }
                 }
-                println!("pass IP");
 
                 let jwt =
                     jwt_from_credentials(credentials.username, credentials.password, addr, req)
                         .await;
                 let (jwt, jwt_value) = some_or_remove_cookie!(jwt);
-                println!("pass JWT");
 
                 if let Some((cookie, pos, header_pos)) =
                     get_cookie_with_header_pos(req, jwt_cookie_name)
