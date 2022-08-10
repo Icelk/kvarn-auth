@@ -7,10 +7,12 @@ edition = "2021"
 
 [dependencies]
 base64 = "0.13"
+chacha20 = { version = "0.7.0" }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 hmac = "0.12"
 kvarn = { version = "0.4.1", path = "../kvarn", default-features = false }
 log = "0.4"
+p256 = { version = "0.11.1", default-features = false, features = ["ecdsa"] }
 rand = "0.8.5"
 rsa = "0.6"
 serde = "1"

@@ -1,11 +1,15 @@
 #![allow(dead_code)]
+use std::borrow::Cow;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chacha20::cipher::{NewCipher, StreamCipher};
 use futures::FutureExt;
 use hmac::{Hmac, Mac};
+use p256::ecdsa::signature::{Signer, Verifier};
+use rand::Rng;
 pub use rsa;
 use rsa::PublicKey;
 use serde::{de::DeserializeOwned, Serialize};
@@ -224,6 +228,17 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 s.push('.');
                 base64::encode_config_buf(signature, base64::URL_SAFE_NO_PAD, &mut s);
             }
+            ComputedAlgo::EcdsaP256 { private_key, .. } => {
+                let signature = if let Some(ip) = ip {
+                    let mut v = s.as_bytes().to_vec();
+                    v.extend_from_slice(IpBytes::from(ip).as_ref());
+                    private_key.sign(&v)
+                } else {
+                    private_key.sign(s.as_bytes())
+                };
+                s.push('.');
+                base64::encode_config_buf(signature, base64::URL_SAFE_NO_PAD, &mut s);
+            }
         }
         s
     }
@@ -238,9 +253,11 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
     ) -> String {
         static HS_HEADER: &[u8] = r#"{"alg":"HS256"}"#.as_bytes();
         static RS_HEADER: &[u8] = r#"{"alg":"RS256"}"#.as_bytes();
+        static EP_HEADER: &[u8] = r#"{"alg":"EP256"}"#.as_bytes();
         let header = match signing_algo {
             ComputedAlgo::HmacSha256 { .. } => HS_HEADER,
             ComputedAlgo::RSASha256 { .. } => RS_HEADER,
+            ComputedAlgo::EcdsaP256 { .. } => EP_HEADER,
         };
         self.into_jwt(signing_algo, header, seconds_before_expiry, ip)
     }
@@ -308,6 +325,10 @@ impl<'a> Validate for &'a ValidationAlgo {
                     )
                     .map_err(|_| ())
             }
+            ValidationAlgo::EcdsaP256 { public_key } => {
+                let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
+                public_key.verify(data, &sig).map_err(|_| ())
+            }
         }
     }
 }
@@ -349,6 +370,10 @@ impl<'a> Validate for &'a ComputedAlgo {
                 } else {
                     Err(())
                 }
+            }
+            ComputedAlgo::EcdsaP256 { public_key, .. } => {
+                let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
+                public_key.verify(data, &sig).map_err(|_| ())
             }
         }
     }
@@ -464,6 +489,7 @@ impl<T: Serialize + DeserializeOwned> Validation<T> {
     }
 }
 
+#[derive(Debug)]
 struct CredentialsStore<'a> {
     pub username: &'a str,
     pub password: &'a str,
@@ -523,75 +549,147 @@ impl<'a> CredentialsStore<'a> {
 
 #[derive(Debug)]
 pub enum ValidationAlgo {
-    RSASha256 { public_key: rsa::RsaPublicKey },
+    RSASha256 {
+        public_key: rsa::RsaPublicKey,
+    },
+    EcdsaP256 {
+        public_key: p256::ecdsa::VerifyingKey,
+    },
 }
 #[derive(Debug)]
 enum ComputedAlgo {
     HmacSha256 {
         secret: Vec<u8>,
-        credentials_encryption_rsa_private_key: rsa::RsaPrivateKey,
-        credentials_encryption_rsa_public_key: rsa::RsaPublicKey,
+        credentials_key: chacha20::cipher::CipherKey<chacha20::ChaCha12>,
     },
     RSASha256 {
-        private_key: rsa::RsaPrivateKey,
-        public_key: rsa::RsaPublicKey,
+        private_key: Box<rsa::RsaPrivateKey>,
+        public_key: Box<rsa::RsaPublicKey>,
+    },
+    EcdsaP256 {
+        private_key: p256::ecdsa::SigningKey,
+        public_key: p256::ecdsa::VerifyingKey,
+        credentials_key: chacha20::cipher::CipherKey<chacha20::ChaCha12>,
     },
 }
 impl ComputedAlgo {
-    fn public_key(&self) -> &rsa::RsaPublicKey {
+    fn encrypt(&self, b: &[u8]) -> Vec<u8> {
         match self {
-            Self::HmacSha256 {
-                credentials_encryption_rsa_public_key,
-                ..
-            } => credentials_encryption_rsa_public_key,
             Self::RSASha256 {
                 private_key: _,
                 public_key,
-            } => public_key,
+            } => public_key
+                .encrypt(
+                    &mut rand::thread_rng(),
+                    rsa::PaddingScheme::PKCS1v15Encrypt,
+                    b,
+                )
+                .expect("failed to encrypt with RSA"),
+            Self::HmacSha256 {
+                credentials_key, ..
+            }
+            | Self::EcdsaP256 {
+                credentials_key, ..
+            } => {
+                let mut nonce = [0_u8; 12];
+                rand::thread_rng().fill(&mut nonce);
+                let mut cipher = chacha20::ChaCha12::new(credentials_key, &nonce.into());
+                let mut vec = Vec::with_capacity(12 + b.len());
+                vec.extend_from_slice(&nonce);
+                vec.extend_from_slice(b);
+                cipher.apply_keystream(&mut vec[12..]);
+                vec
+            }
         }
     }
-    fn private_key(&self) -> &rsa::RsaPrivateKey {
+    fn decrypt<'a>(&self, b: &'a mut [u8]) -> Option<Cow<'a, [u8]>> {
         match self {
-            Self::HmacSha256 {
-                credentials_encryption_rsa_private_key,
-                ..
-            } => credentials_encryption_rsa_private_key,
             Self::RSASha256 {
-                public_key: _,
                 private_key,
-            } => private_key,
+                public_key: _,
+            } => private_key
+                .decrypt(rsa::PaddingScheme::PKCS1v15Encrypt, b)
+                .map(Cow::Owned)
+                .ok(),
+            Self::HmacSha256 {
+                credentials_key, ..
+            }
+            | Self::EcdsaP256 {
+                credentials_key, ..
+            } => {
+                let mut nonce = [0_u8; 12];
+                nonce.copy_from_slice(b.get(..12)?);
+                let mut cipher = chacha20::ChaCha12::new(credentials_key, &nonce.into());
+                cipher.apply_keystream(&mut b[12..]);
+                Some(Cow::Borrowed(&b[12..]))
+            }
         }
     }
 }
 impl From<CryptoAlgo> for ComputedAlgo {
     fn from(alg: CryptoAlgo) -> Self {
         match alg {
-            CryptoAlgo::HmacSha256 {
+            CryptoAlgo::HmacSha256 { secret } => Self::HmacSha256 {
+                credentials_key: {
+                    let mut hasher = sha2::Sha256::new();
+                    hasher.update(&secret);
+                    hasher.finalize()
+                },
                 secret,
-                credentials_encryption_rsa_private_key,
-            } => Self::HmacSha256 {
-                secret,
-                credentials_encryption_rsa_public_key: rsa::RsaPublicKey::from(
-                    &credentials_encryption_rsa_private_key,
-                ),
-                credentials_encryption_rsa_private_key,
             },
             CryptoAlgo::RSASha256 { private_key } => Self::RSASha256 {
-                public_key: rsa::RsaPublicKey::from(&private_key),
-                private_key,
+                public_key: Box::new(rsa::RsaPublicKey::from(&private_key)),
+                private_key: Box::new(private_key),
             },
+            CryptoAlgo::EcdsaP256 { secret } => {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&secret);
+                let hash = hasher.finalize();
+                let private_key = p256::ecdsa::SigningKey::from_bytes(&hash)
+                    .expect("failed to construct a Ecdsa key");
+                Self::EcdsaP256 {
+                    public_key: private_key.verifying_key(),
+                    private_key,
+                    credentials_key: hash,
+                }
+            }
         }
     }
 }
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // this is just the user-facing algo selector, it quickly gets
+                                     // converted to a smaller enum
 pub enum CryptoAlgo {
     HmacSha256 {
         secret: Vec<u8>,
-        credentials_encryption_rsa_private_key: rsa::RsaPrivateKey,
     },
     RSASha256 {
         private_key: rsa::RsaPrivateKey,
     },
+    /// This is the recommended algo, as it allows verification without the secret (see
+    /// [`ecdsa_sk`] for more details on how to share the verification key) (RSA can also do this), is 1000x faster than
+    /// RSA, and takes up 70% less space than RSA. It's also takes any byte array as a secret.
+    EcdsaP256 {
+        /// Does currently not correspond to PKCS#8 certificates.
+        /// This can be anything you'd like.
+        secret: Vec<u8>,
+    },
+}
+/// Get the signing key for `secret`.
+///
+/// # Sharing verifying key
+///
+/// Get the verifying key by using the `verifying_key` method on the returned value.
+/// You can then use the methods [`to_encoded_point`](https://docs.rs/ecdsa/0.14.1/ecdsa/struct.VerifyingKey.html#method.to_encoded_point)
+/// and [`from_encoded_point`](https://docs.rs/ecdsa/0.14.1/ecdsa/struct.VerifyingKey.html#method.from_encoded_point)
+/// (or any similar methods, like the Serialize serde implementation of the struct)
+/// to serialize and share the verifying key, and then constructing [`ValidationAlgo::EcdsaP256`]
+/// with that key.
+pub fn ecdsa_sk(secret: &[u8]) -> p256::ecdsa::SigningKey {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&secret);
+    let hash = hasher.finalize();
+    p256::ecdsa::SigningKey::from_bytes(&hash).expect("failed to construct a Ecdsa key")
 }
 #[derive(Debug, Clone)]
 enum Mode {
@@ -621,7 +719,14 @@ impl Builder {
     /// Sets the URL endpoint where your frontend authenticates to.
     pub fn with_auth_page_name(mut self, auth_page_name: impl Into<String>) -> Self {
         let s = auth_page_name.into();
-        let jwt_page_name_extension = s.replace('/', "-");
+        let jwt_page_name_extension = s.replace(
+            |c: char| {
+                u8::try_from(c as u32).map_or(true, |b| {
+                    !kvarn::prelude::utils::is_valid_header_value_byte(b)
+                })
+            },
+            "-",
+        );
         self.jwt_page_name_extension = jwt_page_name_extension;
         self.auth_page_name = Some(s);
         self
@@ -820,17 +925,6 @@ pub struct Config<
     jwt_validity: Duration,
     credentials_cookie_validity: Duration,
     cookie_path: String,
-    // `TODO`: log out (just send set-cookie headers)
-    // `TODO`: make clearing of cookies into a function
-
-    // `TODO`: implement ECDSA
-    // https://datatracker.ietf.org/doc/html/rfc7518#section-3.4
-    // https://docs.rs/p256/latest/p256/ecdsa/index.html
-    //
-    // `TODO`: use a symmetric cipher to encrypt credentials token
-    // key is hashed, 12 bit nonce is prepended
-    // https://docs.rs/chacha20/0.9.0/chacha20/#example
-    //
     // `TODO`: cfg - cargo features
 }
 impl<
@@ -875,7 +969,7 @@ impl<
             },
         )
     }
-    /// Create an API route at [`Builder::auth_page_name`] and make the JWT token automatically
+    /// Create an API route at [`Builder::with_auth_page_name`] and make the JWT token automatically
     /// refresh.
     ///
     /// To log in, use JavaScript's `fetch` with method POST or PUT to the `auth_page_name`,
@@ -916,6 +1010,9 @@ impl<
             Mode::Validate(_v) => panic!("Called mount on a config acting as a validator."),
         };
 
+        let jwt_refresh_page =
+            format!("/./jwt-auth-refresh-token/{}", self.jwt_page_name_extension);
+
         let config = self.clone();
         let show_auth_page_when_unauthorized = config.show_auth_page_when_unauthorized.clone();
         let auth_page_name = config.auth_page_name.clone();
@@ -940,6 +1037,8 @@ impl<
         };
         let validate: Box<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync> =
             Box::new(validate);
+        let prime_jwt_refresh_page = Uri::try_from(&jwt_refresh_page)
+            .expect("we converted all non-header safe values to hyphens");
 
         extensions.add_prime(
             prime!(
@@ -949,7 +1048,8 @@ impl<
                 move |validate: Box<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync>,
                       show_auth_page_when_unauthorized: Option<String>,
                       auth_page_name: String,
-                      cookie_path: String| {
+                      cookie_path: String,
+                      prime_jwt_refresh_page: Uri| {
                     if !req.uri().path().starts_with(cookie_path)
                         || req.uri().path() == auth_page_name
                     {
@@ -967,7 +1067,7 @@ impl<
                             })
                         }
                         AuthState::Missing => None,
-                        AuthState::Incorrect => Some(Uri::from_static("/./jwt-auth-refresh-token")),
+                        AuthState::Incorrect => Some(prime_jwt_refresh_page.clone()),
                     }
                 }
             ),
@@ -1104,7 +1204,8 @@ impl<
                         }
                         return fat_response;
                     } else {
-                        // don't call
+                        // don't recursively call handle_cache, which could lead to this codepath
+                        // again
                         return default_error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             host,
@@ -1126,17 +1227,15 @@ impl<
                     &mut rsa_credentials,
                 )
                 .ok());
-                let key = refresh_signing_algo.private_key();
-                #[allow(clippy::let_and_return)]
-                let decrypted = some_or_remove_cookie!({
-                    // this is needed for some weird Rust reason
-                    let d = key
-                        .decrypt(rsa::PaddingScheme::PKCS1v15Encrypt, &rsa_credentials)
-                        .ok();
-                    d
-                });
+                println!("decode");
+                println!("{cookie_path}, {refresh_signing_algo:?}",);
+                println!("decrypt {}", String::from_utf8_lossy(&rsa_credentials));
+                let decrypted =
+                    some_or_remove_cookie!(refresh_signing_algo.decrypt(&mut rsa_credentials));
+                println!("decrypted {}", String::from_utf8_lossy(&decrypted));
                 let (credentials, credentials_ip) =
                     some_or_remove_cookie!(CredentialsStore::from_bytes(&decrypted).ok());
+                println!("got credentials: {credentials:?}");
 
                 if let Some(ip) = credentials_ip {
                     // the IP addresses doesn't match
@@ -1144,11 +1243,13 @@ impl<
                         some_or_remove_cookie!(None);
                     }
                 }
+                println!("pass IP");
 
                 let jwt =
                     jwt_from_credentials(credentials.username, credentials.password, addr, req)
                         .await;
                 let (jwt, jwt_value) = some_or_remove_cookie!(jwt);
+                println!("pass JWT");
 
                 if let Some((cookie, pos, header_pos)) =
                     get_cookie_with_header_pos(req, jwt_cookie_name)
@@ -1211,7 +1312,7 @@ impl<
                 fat_response
             }
         );
-        extensions.add_prepare_single("/./jwt-auth-refresh-token", prepare_extension);
+        extensions.add_prepare_single(jwt_refresh_page, prepare_extension);
 
         // `/<auth-page-name>` to accept POST & PUT methods and the return a jwt and credentials
         // token. (use same jwt function as the other page)
@@ -1318,14 +1419,7 @@ impl<
                     } else {
                         None
                     });
-                    let encrypted = signing_algo
-                        .public_key()
-                        .encrypt(
-                            &mut rand::thread_rng(),
-                            rsa::PaddingScheme::PKCS1v15Encrypt,
-                            &credentials_bin,
-                        )
-                        .expect("failed to encrypt credentials with RSA");
+                    let encrypted = signing_algo.encrypt(&credentials_bin);
                     let mut credentials_header = String::new();
                     base64::encode_config_buf(
                         &encrypted,
@@ -1356,13 +1450,10 @@ mod tests {
     static HEADER: &[u8] = r#"{"alg":"HS256"}"#.as_bytes();
 
     fn test_computed_algo(secret: &[u8]) -> ComputedAlgo {
-        let pk = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 128).unwrap();
-        let pubk = rsa::RsaPublicKey::from(&pk);
-        ComputedAlgo::HmacSha256 {
+        CryptoAlgo::HmacSha256 {
             secret: secret.to_vec(),
-            credentials_encryption_rsa_private_key: pk,
-            credentials_encryption_rsa_public_key: pubk,
         }
+        .into()
     }
 
     #[test]
@@ -1421,6 +1512,13 @@ mod tests {
         match v {
             Validation::Authorized(_) => panic!("should be unauthorized"),
             Validation::Unauthorized => {}
+        }
+    }
+    #[test]
+    fn p256_hash_key() {
+        for _ in 0..1000 {
+            let secret: [u8; 32] = rand::random();
+            let _key = p256::ecdsa::SigningKey::from_bytes(&secret).unwrap();
         }
     }
 }
