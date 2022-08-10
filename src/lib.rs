@@ -87,6 +87,7 @@ fn remove_set_cookie(
             .expect("a user-supplied cookie_name or the cookie_path contains illegal bytes for use in a header"),
     );
 }
+#[derive(Debug)]
 pub enum AuthData<T: Serialize + DeserializeOwned = ()> {
     Text(String),
     Number(f64),
@@ -244,6 +245,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         self.into_jwt(signing_algo, header, seconds_before_expiry, ip)
     }
 }
+#[derive(Debug)]
 pub enum Validation<T: Serialize + DeserializeOwned> {
     /// This can come from multiple sources, including but not limited to:
     /// - invalid base64 encoding
@@ -401,7 +403,7 @@ fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<serd
     if parts.len() != 3 {
         return None;
     }
-    let signature_input = &s[..parts[0].len() + parts[1].len() + 1];
+    let signature_input = &s[..parts[0].len() + 1 + parts[1].len()];
     let remote_signature = base64::decode_config(parts[2], base64::URL_SAFE_NO_PAD).ok()?;
     if validate
         .validate(signature_input.as_bytes(), &remote_signature, ip)
@@ -596,6 +598,9 @@ enum Mode {
     Sign(Arc<ComputedAlgo>),
     Validate(Arc<ValidationAlgo>),
 }
+/// You can use multiple authentication setups on a single site, but make sure that the
+/// [`Builder::with_cookie_path`] do not overlap. You MUST set `with_cookie_path` to use more than
+/// 1 auth setup.
 #[derive(Debug, Default)]
 pub struct Builder {
     auth_page_name: Option<String>,
@@ -701,10 +706,7 @@ impl Builder {
     ///
     /// Panics if `show_auth_page_when_unauthorized` cannot be converted into an
     /// [`kvarn::prelude::Uri`].
-    pub fn with_show_auth_page_when_unauthorized(
-        mut self,
-        auth_page: impl Into<String>,
-    ) -> Self {
+    pub fn with_show_auth_page_when_unauthorized(mut self, auth_page: impl Into<String>) -> Self {
         let s = auth_page.into();
         if kvarn::prelude::Uri::try_from(&s).is_err() {
             panic!("show_auth_page_when_unauthorized contains illegal bytes")
@@ -889,7 +891,7 @@ impl<
     pub fn mount(self: &Arc<Self>, extensions: &mut kvarn::Extensions) {
         use kvarn::prelude::*;
 
-        #[derive(Debug)]
+        #[derive(Debug, PartialEq, Eq)]
         enum AuthState {
             Authorized,
             /// Only the JWT cookie is definitely invalid. We will try to refresh the JWT
@@ -916,6 +918,7 @@ impl<
 
         let config = self.clone();
         let show_auth_page_when_unauthorized = config.show_auth_page_when_unauthorized.clone();
+        let auth_page_name = config.auth_page_name.clone();
         let cookie_path = config.cookie_path.clone();
         let prime_signing_algo = signing_algo.clone();
         let validate = move |req: &FatRequest, addr: SocketAddr| {
@@ -945,11 +948,20 @@ impl<
                 addr,
                 move |validate: Box<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync>,
                       show_auth_page_when_unauthorized: Option<String>,
+                      auth_page_name: String,
                       cookie_path: String| {
+                    if !req.uri().path().starts_with(cookie_path)
+                        || req.uri().path() == auth_page_name
+                    {
+                        return None;
+                    }
                     let state: AuthState = validate(req, addr);
                     match state {
                         AuthState::Authorized => None,
-                        AuthState::Missing if req.uri().path().starts_with(cookie_path) => {
+                        AuthState::Missing
+                            if req.uri().path().starts_with(cookie_path)
+                                && req.uri().path() != auth_page_name =>
+                        {
                             show_auth_page_when_unauthorized.as_ref().map(|path| {
                                 Uri::try_from(path).expect("invalid bytes in auth path")
                             })
@@ -1070,6 +1082,39 @@ impl<
                 }
 
                 let req: &mut FatRequest = req;
+
+                if let Some(header) = req.headers().get("x-kvarn-auth-processed") {
+                    error!(
+                        "This request has been processed by another auth instance or ourselves. \
+                        If you are certain you specified different \
+                        `cookie_path`s in the builder, please report this bug. \
+                        If this message occurs more than once, it's a serious recursion bug."
+                    );
+                    if header == "true" {
+                        req.headers_mut()
+                            .insert("x-kvarn-auth-processed", HeaderValue::from_static("error"));
+                        // try to get actual response
+                        remove_cookie(req, credentials_cookie_name);
+                        remove_cookie(req, jwt_cookie_name);
+
+                        let response = kvarn::handle_cache(req, addr, host).await;
+                        let mut fat_response = FatResponse::no_cache(response.response);
+                        if let Some(f) = response.future {
+                            fat_response = fat_response.with_future(f);
+                        }
+                        return fat_response;
+                    } else {
+                        // don't call
+                        return default_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            host,
+                            Some("auth experienced an internal error"),
+                        )
+                        .await;
+                    }
+                }
+                req.headers_mut()
+                    .insert("x-kvarn-auth-processed", HeaderValue::from_static("true"));
 
                 let credentials_cookie = get_cookie(req, credentials_cookie_name);
                 let credentials =
