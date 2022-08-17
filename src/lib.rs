@@ -15,7 +15,7 @@ use futures::FutureExt;
 use hmac::{Hmac, Mac};
 #[cfg(feature = "ecdsa")]
 use p256::ecdsa::signature::{Signer, Verifier};
-#[cfg(any(feature = "ecdsa", feature = "rsa", feature = "hmac"))]
+#[cfg(any(feature = "ecdsa", feature = "hmac"))]
 use rand::Rng;
 #[cfg(feature = "rsa")]
 pub use rsa;
@@ -24,7 +24,9 @@ use rsa::PublicKey;
 #[cfg(feature = "structured")]
 use serde::{de::DeserializeOwned, Serialize};
 #[cfg(any(feature = "ecdsa", feature = "rsa", feature = "hmac"))]
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+#[cfg(not(any(feature = "ecdsa", feature = "rsa", feature = "hmac")))]
+compile_error!("At least one algorithm has to be enabled.");
 
 /// Trait to allow type bounds when serde isn't enabled.
 #[cfg(not(feature = "structured"))]
@@ -127,7 +129,7 @@ pub enum AuthData<T: Serialize + DeserializeOwned = ()> {
 }
 #[cfg(feature = "hmac")]
 fn hmac_sha256(secret: &[u8], bytes: &[u8]) -> impl AsRef<[u8]> {
-    type HmacSha256 = Hmac<Sha256>;
+    type HmacSha256 = Hmac<sha2::Sha256>;
     // Hmac can take a key of any length
     let mut hmac = HmacSha256::new_from_slice(secret).unwrap();
     hmac.update(bytes);
@@ -231,7 +233,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
             #[cfg(feature = "hmac")]
             ComputedAlgo::HmacSha256 { secret, .. } => {
                 // Hmac can take a key of any length
-                let mut hmac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+                let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(secret).unwrap();
                 hmac.update(s.as_bytes());
                 if let Some(ip) = ip {
                     hmac.update(IpBytes::from(ip).as_ref());
@@ -315,7 +317,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 json.push_str(&n.to_string());
                 json.push(',');
             }
-            Self::Structured(t) => {
+            Self::Structured(_t) => {
                 panic!("Using AuthData::Structured without the serde feature enabled")
             }
         };
@@ -334,7 +336,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
             #[cfg(feature = "hmac")]
             ComputedAlgo::HmacSha256 { secret, .. } => {
                 // Hmac can take a key of any length
-                let mut hmac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+                let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(secret).unwrap();
                 hmac.update(s.as_bytes());
                 if let Some(ip) = ip {
                     hmac.update(IpBytes::from(ip).as_ref());
@@ -441,12 +443,15 @@ impl AsRef<[u8]> for IpBytes {
 trait Validate {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()>;
 }
+#[cfg(any(feature = "rsa", feature = "ecdsa"))]
 impl Validate for ValidationAlgo {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         (&self).validate(data, signature, ip)
     }
 }
+#[cfg(any(feature = "rsa", feature = "ecdsa"))]
 impl<'a> Validate for &'a ValidationAlgo {
+    #[allow(unused_variables)] // cfg
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         match *self {
             #[cfg(feature = "rsa")]
@@ -481,6 +486,7 @@ impl Validate for ComputedAlgo {
     }
 }
 impl<'a> Validate for &'a ComputedAlgo {
+    #[allow(unused_variables)] // cfg
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         match *self {
             #[cfg(feature = "rsa")]
@@ -504,7 +510,7 @@ impl<'a> Validate for &'a ComputedAlgo {
             #[cfg(feature = "hmac")]
             ComputedAlgo::HmacSha256 { secret, .. } => {
                 // Hmac can take a key of any length
-                let mut hmac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+                let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(secret).unwrap();
                 hmac.update(data);
                 if let Some(ip) = ip {
                     hmac.update(IpBytes::from(ip).as_ref());
@@ -533,6 +539,7 @@ impl<'a> Validate for &'a Mode {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         match *self {
             Mode::Sign(s) => s.validate(data, signature, ip),
+            #[cfg(any(feature = "rsa", feature = "ecdsa"))]
             Mode::Validate(v) => v.validate(data, signature, ip),
         }
     }
@@ -573,30 +580,30 @@ macro_rules! or_unauthorized {
 /// Returns [`None`] if `s` is not a valid JWT for `secret` and the current time.
 #[cfg(feature = "structured")]
 fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<serde_json::Value> {
-let parts = s.splitn(3, '.').collect::<Vec<_>>();
-if parts.len() != 3 {
-return None;
-}
-let signature_input = &s[..parts[0].len() + 1 + parts[1].len()];
-let remote_signature = base64::decode_config(parts[2], base64::URL_SAFE_NO_PAD).ok()?;
-if validate
-.validate(signature_input.as_bytes(), &remote_signature, ip)
-.is_err()
-{
-return None;
-}
-let payload = base64::decode_config(parts[1], base64::URL_SAFE_NO_PAD)
-.ok()
-.and_then(|p| String::from_utf8(p).ok())?;
-let mut payload_value: serde_json::Value = payload.parse().ok()?;
-let payload = payload_value.as_object_mut()?;
-let exp = payload.get("exp").and_then(|v| v.as_u64())?;
-let iat = payload.get("iat").and_then(|v| v.as_u64())?;
-let now = seconds_since_epoch();
-if exp < now || iat > now {
-return None;
-}
-Some(payload_value)
+    let parts = s.splitn(3, '.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return None;
+    }
+    let signature_input = &s[..parts[0].len() + 1 + parts[1].len()];
+    let remote_signature = base64::decode_config(parts[2], base64::URL_SAFE_NO_PAD).ok()?;
+    if validate
+        .validate(signature_input.as_bytes(), &remote_signature, ip)
+        .is_err()
+    {
+        return None;
+    }
+    let payload = base64::decode_config(parts[1], base64::URL_SAFE_NO_PAD)
+        .ok()
+        .and_then(|p| String::from_utf8(p).ok())?;
+    let mut payload_value: serde_json::Value = payload.parse().ok()?;
+    let payload = payload_value.as_object_mut()?;
+    let exp = payload.get("exp").and_then(|v| v.as_u64())?;
+    let iat = payload.get("iat").and_then(|v| v.as_u64())?;
+    let now = seconds_since_epoch();
+    if exp < now || iat > now {
+        return None;
+    }
+    Some(payload_value)
 }
 /// Returns [`None`] if `s` is not a valid JWT for `secret` and the current time.
 #[cfg(not(feature = "structured"))]
@@ -632,7 +639,7 @@ fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<JwtD
         entries = entries.strip_prefix('"')?;
         let (key, value) = unescape::unescape_until_quote(entries).and_then(|(name, pos)| {
             // +1 for the quote
-            entries = &entries[pos + 1..].trim_start();
+            entries = entries[pos + 1..].trim_start();
             entries = entries.strip_prefix(',')?.trim_start();
             entries = entries.strip_prefix('"')?.trim_start();
             unescape::unescape_until_quote(entries).map(|(value, pos)| {
@@ -705,7 +712,7 @@ impl<T: Serialize + DeserializeOwned> Validation<T> {
 impl<T: Serialize + DeserializeOwned> Validation<T> {
     #[allow(clippy::match_result_ok)] // macro
     fn from_jwt(s: &str, validator: impl Validate, ip: Option<IpAddr>) -> Self {
-        let mut data = or_unauthorized!(validate(s, validator, ip));
+        let data = or_unauthorized!(validate(s, validator, ip));
         let data = match (data.num, data.text) {
             (Some(num), Some(text)) => AuthData::TextNumber(text, num),
             (Some(num), None) => AuthData::Number(num),
@@ -775,6 +782,7 @@ impl<'a> CredentialsStore<'a> {
 }
 
 #[derive(Debug)]
+#[cfg(any(feature = "rsa", feature = "ecdsa"))]
 pub enum ValidationAlgo {
     #[cfg(feature = "rsa")]
     RSASha256 { public_key: rsa::RsaPublicKey },
@@ -950,6 +958,7 @@ pub fn ecdsa_sk(secret: &[u8]) -> p256::ecdsa::SigningKey {
 #[derive(Debug, Clone)]
 enum Mode {
     Sign(Arc<ComputedAlgo>),
+    #[cfg(any(feature = "rsa", feature = "ecdsa"))]
     Validate(Arc<ValidationAlgo>),
 }
 /// You can use multiple authentication setups on a single site, but make sure that the
@@ -1131,6 +1140,7 @@ impl Builder {
         self._build(is_allowed, Mode::Sign(Arc::new(pk.into())))
     }
     #[allow(clippy::type_complexity)]
+    #[cfg(any(feature = "rsa", feature = "ecdsa"))]
     pub fn build_validate(
         self,
         validation_key: ValidationAlgo,
@@ -1260,6 +1270,7 @@ impl<
 
         let signing_algo = match &self.mode {
             Mode::Sign(s) => Arc::clone(s),
+            #[cfg(any(feature = "rsa", feature = "ecdsa"))]
             Mode::Validate(_v) => panic!("Called mount on a config acting as a validator."),
         };
 
