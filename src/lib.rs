@@ -5,15 +5,37 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// #[cfg(not(feature = "structured"))]
+mod unescape;
+
+#[cfg(feature = "chacha20")]
 use chacha20::cipher::{NewCipher, StreamCipher};
 use futures::FutureExt;
+#[cfg(feature = "hmac")]
 use hmac::{Hmac, Mac};
+#[cfg(feature = "ecdsa")]
 use p256::ecdsa::signature::{Signer, Verifier};
+#[cfg(any(feature = "ecdsa", feature = "rsa", feature = "hmac"))]
 use rand::Rng;
+#[cfg(feature = "rsa")]
 pub use rsa;
+#[cfg(feature = "rsa")]
 use rsa::PublicKey;
+#[cfg(feature = "structured")]
 use serde::{de::DeserializeOwned, Serialize};
+#[cfg(any(feature = "ecdsa", feature = "rsa", feature = "hmac"))]
 use sha2::{Digest, Sha256};
+
+/// Trait to allow type bounds when serde isn't enabled.
+#[cfg(not(feature = "structured"))]
+pub trait Serialize {}
+#[cfg(not(feature = "structured"))]
+impl<T> Serialize for T {}
+/// Trait to allow type bounds when serde isn't enabled.
+#[cfg(not(feature = "structured"))]
+pub trait DeserializeOwned {}
+#[cfg(not(feature = "structured"))]
+impl<T> DeserializeOwned for T {}
 
 fn seconds_since_epoch() -> u64 {
     SystemTime::now()
@@ -93,13 +115,17 @@ fn remove_set_cookie(
 }
 #[derive(Debug)]
 pub enum AuthData<T: Serialize + DeserializeOwned = ()> {
+    None,
     Text(String),
     Number(f64),
     TextNumber(String, f64),
     /// Fields `iat`, `exp`, and `__variant` are overriden and will not be visible when the
     /// JWT is decoded.
+    ///
+    /// This panics when the serde feature is not enabled.
     Structured(T),
 }
+#[cfg(feature = "hmac")]
 fn hmac_sha256(secret: &[u8], bytes: &[u8]) -> impl AsRef<[u8]> {
     type HmacSha256 = Hmac<Sha256>;
     // Hmac can take a key of any length
@@ -118,6 +144,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
     ///
     /// Panics if a number is `NaN` or an infinity.
     /// The structured data (if that's what this is) must not error when being serialized.
+    #[cfg(feature = "structured")]
     fn into_jwt(
         self,
         signing_algo: &ComputedAlgo,
@@ -128,6 +155,11 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         let mut s = String::new();
         base64::encode_config_buf(header, base64::URL_SAFE_NO_PAD, &mut s);
         let mut map = match self {
+            Self::None => {
+                let mut map = serde_json::Map::new();
+                map.insert("__variant".to_owned(), "e".into());
+                map
+            }
             Self::Text(t) => {
                 let mut map = serde_json::Map::new();
                 map.insert("text".to_owned(), serde_json::Value::String(t));
@@ -196,6 +228,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         base64::encode_config_buf(payload.as_bytes(), base64::URL_SAFE_NO_PAD, &mut s);
 
         match signing_algo {
+            #[cfg(feature = "hmac")]
             ComputedAlgo::HmacSha256 { secret, .. } => {
                 // Hmac can take a key of any length
                 let mut hmac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
@@ -207,6 +240,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 s.push('.');
                 base64::encode_config_buf(sig, base64::URL_SAFE_NO_PAD, &mut s);
             }
+            #[cfg(feature = "rsa")]
             ComputedAlgo::RSASha256 {
                 private_key,
                 public_key: _,
@@ -228,6 +262,110 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 s.push('.');
                 base64::encode_config_buf(signature, base64::URL_SAFE_NO_PAD, &mut s);
             }
+            #[cfg(feature = "ecdsa")]
+            ComputedAlgo::EcdsaP256 { private_key, .. } => {
+                let signature = if let Some(ip) = ip {
+                    let mut v = s.as_bytes().to_vec();
+                    v.extend_from_slice(IpBytes::from(ip).as_ref());
+                    private_key.sign(&v)
+                } else {
+                    private_key.sign(s.as_bytes())
+                };
+                s.push('.');
+                base64::encode_config_buf(signature, base64::URL_SAFE_NO_PAD, &mut s);
+            }
+        }
+        s
+    }
+    /// # Panics
+    ///
+    /// Panics if a number is `NaN` or an infinity.
+    /// The structured data (if that's what this is) must not error when being serialized.
+    #[cfg(not(feature = "structured"))]
+    fn into_jwt(
+        self,
+        signing_algo: &ComputedAlgo,
+        header: &[u8],
+        seconds_before_expiry: u64,
+        ip: Option<IpAddr>,
+    ) -> String {
+        let mut s = String::new();
+        base64::encode_config_buf(header, base64::URL_SAFE_NO_PAD, &mut s);
+        let mut json = String::new();
+        json.push_str(r#"{"__variant":"#);
+        match self {
+            Self::None => {
+                json.push_str(r#""e","#);
+            }
+            Self::Text(t) => {
+                json.push_str(r#""t","text":""#);
+                json.push_str(&t.escape_default().to_string());
+                json.push_str("\",");
+            }
+            Self::Number(n) => {
+                json.push_str(r#""n","num":"#);
+                json.push_str(&n.to_string());
+                json.push(',');
+            }
+            Self::TextNumber(t, n) => {
+                json.push_str(r#""tn","text":""#);
+                json.push_str(&t.escape_default().to_string());
+                json.push_str("\",");
+                json.push_str(r#""num":"#);
+                json.push_str(&n.to_string());
+                json.push(',');
+            }
+            Self::Structured(t) => {
+                panic!("Using AuthData::Structured without the serde feature enabled")
+            }
+        };
+        let now = seconds_since_epoch();
+        json.push_str(r#""iat":"#);
+        json.push_str(&now.to_string());
+        json.push(',');
+        json.push_str(r#""exp":"#);
+        json.push_str(&(now + seconds_before_expiry).to_string());
+        json.push('}');
+        let payload = json;
+        s.push('.');
+        base64::encode_config_buf(payload.as_bytes(), base64::URL_SAFE_NO_PAD, &mut s);
+
+        match signing_algo {
+            #[cfg(feature = "hmac")]
+            ComputedAlgo::HmacSha256 { secret, .. } => {
+                // Hmac can take a key of any length
+                let mut hmac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+                hmac.update(s.as_bytes());
+                if let Some(ip) = ip {
+                    hmac.update(IpBytes::from(ip).as_ref());
+                }
+                let sig = hmac.finalize().into_bytes();
+                s.push('.');
+                base64::encode_config_buf(sig, base64::URL_SAFE_NO_PAD, &mut s);
+            }
+            #[cfg(feature = "rsa")]
+            ComputedAlgo::RSASha256 {
+                private_key,
+                public_key: _,
+            } => {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(s.as_bytes());
+                if let Some(ip) = ip {
+                    hasher.update(IpBytes::from(ip).as_ref());
+                }
+                let hash = hasher.finalize();
+                let signature = private_key
+                    .sign(
+                        rsa::PaddingScheme::PKCS1v15Sign {
+                            hash: Some(rsa::Hash::SHA2_256),
+                        },
+                        &*hash,
+                    )
+                    .expect("failed to sign JWT with RSA key");
+                s.push('.');
+                base64::encode_config_buf(signature, base64::URL_SAFE_NO_PAD, &mut s);
+            }
+            #[cfg(feature = "ecdsa")]
             ComputedAlgo::EcdsaP256 { private_key, .. } => {
                 let signature = if let Some(ip) = ip {
                     let mut v = s.as_bytes().to_vec();
@@ -253,10 +391,13 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
     ) -> String {
         static HS_HEADER: &[u8] = r#"{"alg":"HS256"}"#.as_bytes();
         static RS_HEADER: &[u8] = r#"{"alg":"RS256"}"#.as_bytes();
-        static EP_HEADER: &[u8] = r#"{"alg":"EP256"}"#.as_bytes();
+        static EP_HEADER: &[u8] = r#"{"alg":"ES256"}"#.as_bytes();
         let header = match signing_algo {
+            #[cfg(feature = "hmac")]
             ComputedAlgo::HmacSha256 { .. } => HS_HEADER,
+            #[cfg(feature = "rsa")]
             ComputedAlgo::RSASha256 { .. } => RS_HEADER,
+            #[cfg(feature = "ecdsa")]
             ComputedAlgo::EcdsaP256 { .. } => EP_HEADER,
         };
         self.into_jwt(signing_algo, header, seconds_before_expiry, ip)
@@ -291,8 +432,8 @@ impl From<IpAddr> for IpBytes {
 impl AsRef<[u8]> for IpBytes {
     fn as_ref(&self) -> &[u8] {
         match self {
-            Self::V4(addr) => &*addr,
-            Self::V6(addr) => &*addr,
+            Self::V4(addr) => addr,
+            Self::V6(addr) => addr,
         }
     }
 }
@@ -308,6 +449,7 @@ impl Validate for ValidationAlgo {
 impl<'a> Validate for &'a ValidationAlgo {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         match *self {
+            #[cfg(feature = "rsa")]
             ValidationAlgo::RSASha256 { public_key } => {
                 let mut hasher = sha2::Sha256::new();
                 hasher.update(data);
@@ -325,6 +467,7 @@ impl<'a> Validate for &'a ValidationAlgo {
                     )
                     .map_err(|_| ())
             }
+            #[cfg(feature = "ecdsa")]
             ValidationAlgo::EcdsaP256 { public_key } => {
                 let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
                 public_key.verify(data, &sig).map_err(|_| ())
@@ -340,6 +483,7 @@ impl Validate for ComputedAlgo {
 impl<'a> Validate for &'a ComputedAlgo {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         match *self {
+            #[cfg(feature = "rsa")]
             ComputedAlgo::RSASha256 { public_key, .. } => {
                 let mut hasher = sha2::Sha256::new();
                 hasher.update(data);
@@ -357,6 +501,7 @@ impl<'a> Validate for &'a ComputedAlgo {
                     )
                     .map_err(|_| ())
             }
+            #[cfg(feature = "hmac")]
             ComputedAlgo::HmacSha256 { secret, .. } => {
                 // Hmac can take a key of any length
                 let mut hmac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
@@ -371,6 +516,7 @@ impl<'a> Validate for &'a ComputedAlgo {
                     Err(())
                 }
             }
+            #[cfg(feature = "ecdsa")]
             ComputedAlgo::EcdsaP256 { public_key, .. } => {
                 let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
                 public_key.verify(data, &sig).map_err(|_| ())
@@ -391,6 +537,7 @@ impl<'a> Validate for &'a Mode {
         }
     }
 }
+#[cfg(all(test, feature = "hmac"))]
 impl<'a> Validate for &'a [u8] {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         // Hmac can take a key of any length
@@ -407,6 +554,7 @@ impl<'a> Validate for &'a [u8] {
         }
     }
 }
+#[cfg(all(test, feature = "hmac"))]
 impl<'a, const LEN: usize> Validate for &'a [u8; LEN] {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         (&self[..]).validate(data, signature, ip)
@@ -423,7 +571,36 @@ macro_rules! or_unauthorized {
     };
 }
 /// Returns [`None`] if `s` is not a valid JWT for `secret` and the current time.
+#[cfg(feature = "structured")]
 fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<serde_json::Value> {
+let parts = s.splitn(3, '.').collect::<Vec<_>>();
+if parts.len() != 3 {
+return None;
+}
+let signature_input = &s[..parts[0].len() + 1 + parts[1].len()];
+let remote_signature = base64::decode_config(parts[2], base64::URL_SAFE_NO_PAD).ok()?;
+if validate
+.validate(signature_input.as_bytes(), &remote_signature, ip)
+.is_err()
+{
+return None;
+}
+let payload = base64::decode_config(parts[1], base64::URL_SAFE_NO_PAD)
+.ok()
+.and_then(|p| String::from_utf8(p).ok())?;
+let mut payload_value: serde_json::Value = payload.parse().ok()?;
+let payload = payload_value.as_object_mut()?;
+let exp = payload.get("exp").and_then(|v| v.as_u64())?;
+let iat = payload.get("iat").and_then(|v| v.as_u64())?;
+let now = seconds_since_epoch();
+if exp < now || iat > now {
+return None;
+}
+Some(payload_value)
+}
+/// Returns [`None`] if `s` is not a valid JWT for `secret` and the current time.
+#[cfg(not(feature = "structured"))]
+fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<JwtData> {
     let parts = s.splitn(3, '.').collect::<Vec<_>>();
     if parts.len() != 3 {
         return None;
@@ -439,16 +616,52 @@ fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<serd
     let payload = base64::decode_config(parts[1], base64::URL_SAFE_NO_PAD)
         .ok()
         .and_then(|p| String::from_utf8(p).ok())?;
-    let mut payload_value: serde_json::Value = payload.parse().ok()?;
-    let payload = payload_value.as_object_mut()?;
-    let exp = payload.get("exp").and_then(|v| v.as_u64())?;
-    let iat = payload.get("iat").and_then(|v| v.as_u64())?;
+    let mut entries = payload.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let mut data = JwtData::default();
+    let mut last_missed_comma = false;
+    loop {
+        entries = if let Some(s) = entries.strip_prefix(',') {
+            s
+        } else {
+            if last_missed_comma {
+                break;
+            }
+            last_missed_comma = true;
+            entries
+        };
+        entries = entries.strip_prefix('"')?;
+        let (key, value) = unescape::unescape_until_quote(entries).and_then(|(name, pos)| {
+            // +1 for the quote
+            entries = &entries[pos + 1..].trim_start();
+            entries = entries.strip_prefix(',')?.trim_start();
+            entries = entries.strip_prefix('"')?.trim_start();
+            unescape::unescape_until_quote(entries).map(|(value, pos)| {
+                entries = &entries[pos + 1..];
+                (name, value)
+            })
+        })?;
+        match key.as_str() {
+            "iat" => data.iat = value.parse().ok()?,
+            "exp" => data.exp = value.parse().ok()?,
+            "num" => data.num = Some(value.parse().ok()?),
+            "text" => data.text = Some(value),
+            _ => log::warn!("Tried to parse JWT with unrecognized field: {key:?}"),
+        }
+    }
     let now = seconds_since_epoch();
-    if exp < now || iat > now {
+    if (data.exp as u64) < now || (data.iat as u64) > now {
         return None;
     }
-    Some(payload_value)
+    Some(data)
 }
+#[derive(Debug, Default)]
+struct JwtData {
+    pub iat: f64,
+    pub exp: f64,
+    pub num: Option<f64>,
+    pub text: Option<String>,
+}
+#[cfg(feature = "structured")]
 impl<T: Serialize + DeserializeOwned> Validation<T> {
     #[allow(clippy::match_result_ok)] // macro
     fn from_jwt(s: &str, validator: impl Validate, ip: Option<IpAddr>) -> Self {
@@ -484,6 +697,20 @@ impl<T: Serialize + DeserializeOwned> Validation<T> {
                 AuthData::Structured(or_unauthorized!(serde_json::from_value(v).ok()))
             }
             _ => return Self::Unauthorized,
+        };
+        Self::Authorized(data)
+    }
+}
+#[cfg(not(feature = "structured"))]
+impl<T: Serialize + DeserializeOwned> Validation<T> {
+    #[allow(clippy::match_result_ok)] // macro
+    fn from_jwt(s: &str, validator: impl Validate, ip: Option<IpAddr>) -> Self {
+        let mut data = or_unauthorized!(validate(s, validator, ip));
+        let data = match (data.num, data.text) {
+            (Some(num), Some(text)) => AuthData::TextNumber(text, num),
+            (Some(num), None) => AuthData::Number(num),
+            (None, Some(text)) => AuthData::Text(text),
+            (None, None) => AuthData::None,
         };
         Self::Authorized(data)
     }
@@ -549,23 +776,26 @@ impl<'a> CredentialsStore<'a> {
 
 #[derive(Debug)]
 pub enum ValidationAlgo {
-    RSASha256 {
-        public_key: rsa::RsaPublicKey,
-    },
+    #[cfg(feature = "rsa")]
+    RSASha256 { public_key: rsa::RsaPublicKey },
+    #[cfg(feature = "ecdsa")]
     EcdsaP256 {
         public_key: p256::ecdsa::VerifyingKey,
     },
 }
 #[derive(Debug)]
 enum ComputedAlgo {
+    #[cfg(feature = "hmac")]
     HmacSha256 {
         secret: Vec<u8>,
         credentials_key: chacha20::cipher::CipherKey<chacha20::ChaCha12>,
     },
+    #[cfg(feature = "rsa")]
     RSASha256 {
         private_key: Box<rsa::RsaPrivateKey>,
         public_key: Box<rsa::RsaPublicKey>,
     },
+    #[cfg(feature = "ecdsa")]
     EcdsaP256 {
         private_key: p256::ecdsa::SigningKey,
         public_key: p256::ecdsa::VerifyingKey,
@@ -575,6 +805,7 @@ enum ComputedAlgo {
 impl ComputedAlgo {
     fn encrypt(&self, b: &[u8]) -> Vec<u8> {
         match self {
+            #[cfg(feature = "rsa")]
             Self::RSASha256 {
                 private_key: _,
                 public_key,
@@ -585,10 +816,21 @@ impl ComputedAlgo {
                     b,
                 )
                 .expect("failed to encrypt with RSA"),
+            #[cfg(feature = "hmac")]
             Self::HmacSha256 {
                 credentials_key, ..
+            } => {
+                let mut nonce = [0_u8; 12];
+                rand::thread_rng().fill(&mut nonce);
+                let mut cipher = chacha20::ChaCha12::new(credentials_key, &nonce.into());
+                let mut vec = Vec::with_capacity(12 + b.len());
+                vec.extend_from_slice(&nonce);
+                vec.extend_from_slice(b);
+                cipher.apply_keystream(&mut vec[12..]);
+                vec
             }
-            | Self::EcdsaP256 {
+            #[cfg(feature = "ecdsa")]
+            Self::EcdsaP256 {
                 credentials_key, ..
             } => {
                 let mut nonce = [0_u8; 12];
@@ -602,8 +844,10 @@ impl ComputedAlgo {
             }
         }
     }
+    #[allow(clippy::match_same_arms)] // cfg
     fn decrypt<'a>(&self, b: &'a mut [u8]) -> Option<Cow<'a, [u8]>> {
         match self {
+            #[cfg(feature = "rsa")]
             Self::RSASha256 {
                 private_key,
                 public_key: _,
@@ -611,10 +855,19 @@ impl ComputedAlgo {
                 .decrypt(rsa::PaddingScheme::PKCS1v15Encrypt, b)
                 .map(Cow::Owned)
                 .ok(),
+            #[cfg(feature = "hmac")]
             Self::HmacSha256 {
                 credentials_key, ..
+            } => {
+                let mut nonce = [0_u8; 12];
+                nonce.copy_from_slice(b.get(..12)?);
+                let mut cipher = chacha20::ChaCha12::new(credentials_key, &nonce.into());
+                cipher.apply_keystream(&mut b[12..]);
+                Some(Cow::Borrowed(&b[12..]))
             }
-            | Self::EcdsaP256 {
+
+            #[cfg(feature = "ecdsa")]
+            Self::EcdsaP256 {
                 credentials_key, ..
             } => {
                 let mut nonce = [0_u8; 12];
@@ -629,6 +882,7 @@ impl ComputedAlgo {
 impl From<CryptoAlgo> for ComputedAlgo {
     fn from(alg: CryptoAlgo) -> Self {
         match alg {
+            #[cfg(feature = "hmac")]
             CryptoAlgo::HmacSha256 { secret } => Self::HmacSha256 {
                 credentials_key: {
                     let mut hasher = sha2::Sha256::new();
@@ -637,10 +891,12 @@ impl From<CryptoAlgo> for ComputedAlgo {
                 },
                 secret,
             },
+            #[cfg(feature = "rsa")]
             CryptoAlgo::RSASha256 { private_key } => Self::RSASha256 {
                 public_key: Box::new(rsa::RsaPublicKey::from(&private_key)),
                 private_key: Box::new(private_key),
             },
+            #[cfg(feature = "ecdsa")]
             CryptoAlgo::EcdsaP256 { secret } => {
                 let mut hasher = sha2::Sha256::new();
                 hasher.update(&secret);
@@ -660,12 +916,11 @@ impl From<CryptoAlgo> for ComputedAlgo {
 #[allow(clippy::large_enum_variant)] // this is just the user-facing algo selector, it quickly gets
                                      // converted to a smaller enum
 pub enum CryptoAlgo {
-    HmacSha256 {
-        secret: Vec<u8>,
-    },
-    RSASha256 {
-        private_key: rsa::RsaPrivateKey,
-    },
+    #[cfg(feature = "hmac")]
+    HmacSha256 { secret: Vec<u8> },
+    #[cfg(feature = "rsa")]
+    RSASha256 { private_key: rsa::RsaPrivateKey },
+    #[cfg(feature = "ecdsa")]
     /// This is the recommended algo, as it allows verification without the secret (see
     /// [`ecdsa_sk`] for more details on how to share the verification key) (RSA can also do this), is 1000x faster than
     /// RSA, and takes up 70% less space than RSA. It's also takes any byte array as a secret.
@@ -685,6 +940,7 @@ pub enum CryptoAlgo {
 /// (or any similar methods, like the Serialize serde implementation of the struct)
 /// to serialize and share the verifying key, and then constructing [`ValidationAlgo::EcdsaP256`]
 /// with that key.
+#[cfg(feature = "ecdsa")]
 pub fn ecdsa_sk(secret: &[u8]) -> p256::ecdsa::SigningKey {
     let mut hasher = sha2::Sha256::new();
     hasher.update(&secret);
@@ -877,7 +1133,7 @@ impl Builder {
     #[allow(clippy::type_complexity)]
     pub fn build_validate(
         self,
-        public_key: rsa::RsaPublicKey,
+        validation_key: ValidationAlgo,
     ) -> Arc<
         Config<
             (),
@@ -899,10 +1155,7 @@ impl Builder {
             SocketAddr,
             &kvarn::FatRequest,
         ) -> core::future::Pending<Validation<()>> = _placeholder;
-        self._build(
-            placeholder,
-            Mode::Validate(Arc::new(ValidationAlgo::RSASha256 { public_key })),
-        )
+        self._build(placeholder, Mode::Validate(Arc::new(validation_key)))
     }
 }
 pub type LoginStatusClosure<T> = Arc<
@@ -1035,11 +1288,13 @@ impl<
                 }
             }
         };
+        #[allow(clippy::type_complexity)]
         let validate: Box<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync> =
             Box::new(validate);
         let prime_jwt_refresh_page = Uri::try_from(&jwt_refresh_page)
             .expect("we converted all non-header safe values to hyphens");
 
+        #[allow(clippy::type_complexity)]
         extensions.add_prime(
             prime!(
                 req,
