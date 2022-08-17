@@ -8,3 +8,8 @@ Everything is configurable.
 **⚠️ Warning: This crate has not been audited. All dependencies I use have. Use at your own risk.**
 
 > I do however personally use this for production systems.
+
+# Front-end usage
+
+A small [JS library](lib.mjs) is provided for logging in and out and to get the current status of the user.
+See it and it's docs for more details.

@@ -201,12 +201,16 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                     if map.contains_key("__variant") {
                         log::warn!("`__variant` key in JWT payload will be overridden");
                     }
+                    if map.contains_key("__deserialize_v") {
+                        log::warn!("`__deserialize_v` key in JWT payload will be overridden");
+                        map.insert("__deserialize_v".to_owned(), serde_json::Value::Bool(false));
+                    }
                     map.insert("__variant".to_owned(), "s".into());
                     map
                 } else {
                     let mut map = serde_json::Map::new();
                     map.insert("v".to_owned(), v);
-                    map.insert("deserialize_v".to_owned(), serde_json::Value::Bool(true));
+                    map.insert("__deserialize_v".to_owned(), serde_json::Value::Bool(true));
                     map.insert("__variant".to_owned(), "s".into());
                     map
                 }
@@ -548,7 +552,7 @@ impl<'a> Validate for &'a Mode {
 impl<'a> Validate for &'a [u8] {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         // Hmac can take a key of any length
-        let mut hmac = Hmac::<Sha256>::new_from_slice(self).unwrap();
+        let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(self).unwrap();
         hmac.update(data);
         if let Some(ip) = ip {
             hmac.update(IpBytes::from(ip).as_ref());
@@ -692,13 +696,14 @@ impl<T: Serialize + DeserializeOwned> Validation<T> {
                 AuthData::TextNumber(s.to_owned(), n)
             }
             "s" => {
-                let serialize_v = payload.get("serialize_v").map_or(false, |v| v == true);
+                let serialize_v = payload.get("__deserialize_v").map_or(false, |v| v == true);
                 let v = if serialize_v {
                     or_unauthorized!(payload.get_mut("v")).take()
                 } else {
                     payload.remove("iat");
                     payload.remove("exp");
                     payload.remove("__variant");
+                    payload.remove("__deserialize_v");
                     serde_json::Value::Object(std::mem::take(payload))
                 };
                 AuthData::Structured(or_unauthorized!(serde_json::from_value(v).ok()))
@@ -1657,15 +1662,26 @@ impl<
                     let body =
                         some_or_return!(std::str::from_utf8(&body).ok(), StatusCode::BAD_REQUEST);
                     let mut lines = body.lines();
-                    let username = some_or_return!(
+                    let username_length = some_or_return!(
                         lines.next(),
                         StatusCode::BAD_REQUEST,
-                        "the first line needs to be the username"
+                        "the first line needs to be the username's length in bytes"
+                    );
+                    let username_length_len = username_length.len();
+                    let username_length: usize = some_or_return!(
+                        username_length.parse().ok(),
+                        StatusCode::BAD_REQUEST,
+                        "the first line needs to be the username's length in bytes"
+                    );
+                    let username = some_or_return!(
+                        body.get(username_length_len..username_length_len + username_length),
+                        StatusCode::BAD_REQUEST,
+                        "the username length was invalid"
                     );
                     let password = some_or_return!(
-                        lines.next(),
+                        body.get(username_length_len + username_length..),
                         StatusCode::BAD_REQUEST,
-                        "the second line needs to be the password"
+                        "the username length was invalid; couldn't read password"
                     );
                     let (jwt_header, _jwt_value) = some_or_return!(
                         auth_jwt_from_credentials(username, password, addr, req).await,
