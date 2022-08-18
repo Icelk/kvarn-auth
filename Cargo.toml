@@ -31,3 +31,7 @@ ecdsa = ["p256", "chacha20", "sha2"]
 rsa = ["dep:rsa", "sha2"]
 hmac = ["dep:hmac", "chacha20", "sha2"]
 structured = ["serde", "serde_json"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
