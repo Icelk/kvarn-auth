@@ -966,14 +966,15 @@ enum Mode {
     #[cfg(any(feature = "rsa", feature = "ecdsa"))]
     Validate(Arc<ValidationAlgo>),
 }
-/// You can use multiple authentication setups on a single site, but make sure that the
-/// [`Builder::with_cookie_path`] do not overlap. You MUST set `with_cookie_path` to use more than
+/// You can use multiple authentication setups on a single site, but make sure that the respective
+/// [`Builder::with_cookie_path`]s do not overlap. You MUST set `with_cookie_path` to use more than
 /// 1 auth setup.
 #[derive(Debug, Default)]
 pub struct Builder {
     auth_page_name: Option<String>,
     jwt_page_name_extension: String,
     samesite_strict: Option<bool>,
+    httponly: Option<bool>,
     relogin_on_ip_change: Option<bool>,
     jwt_cookie_name: Option<String>,
     credentials_cookie_name: Option<String>,
@@ -1001,11 +1002,22 @@ impl Builder {
         self.auth_page_name = Some(s);
         self
     }
-    /// Decrease security for CSRF but allow users to follow links to auth-protected pages from
-    /// other sites.
-    /// This sets the `samsite` property of the cookie to `lax`.
+    /// Decrease security and protection against CSRF but allow users to follow links to
+    /// auth-protected pages from other sites.
+    /// This sets the `SameSite` property of the cookie to `lax`.
     pub fn with_lax_samesite(mut self) -> Self {
         self.samesite_strict = Some(false);
+        self
+    }
+    /// Decrease security and protection against XSS but allow the JavaScript to read the cookie,
+    /// which allows the client to get the logged in status.
+    /// **It's highly recommended to enable [`Builder::with_force_relog_on_ip_change`] when this is
+    /// enabled, as that negates any credential theft, as the credentials are bound to an IP.**
+    ///
+    /// This disables the usual setting of the `HttpOnly` cookie property.
+    /// This does not affect the credentials cookie. That will never be served without `HttpOnly`.
+    pub fn with_relaxed_httponly(mut self) -> Self {
+        self.httponly = Some(false);
         self
     }
     /// Forces relogging by the user when they change IPs. This can protect users from getting
@@ -1111,13 +1123,19 @@ impl Builder {
         is_allowed: F,
         mode: Mode,
     ) -> Arc<Config<T, F, Fut>> {
+        let httponly = self.httponly.unwrap_or(true);
+        let relogin_on_ip_change = self.relogin_on_ip_change.unwrap_or(false);
+        if !httponly && !relogin_on_ip_change {
+            log::warn!("HttpOnly not set and relogin_on_ip_change not set. In case of XSS attacks, the credentials could be leaked");
+        }
         let c = Config {
             mode,
             is_allowed: Arc::new(is_allowed),
             jwt_page_name_extension: self.jwt_page_name_extension,
             auth_page_name: self.auth_page_name.unwrap_or_else(|| "/auth".into()),
             samesite_strict: self.samesite_strict.unwrap_or(true),
-            relogin_on_ip_change: self.relogin_on_ip_change.unwrap_or(false),
+            httponly,
+            relogin_on_ip_change,
             jwt_cookie_name: self.jwt_cookie_name.unwrap_or_else(|| "auth-jwt".into()),
             credentials_cookie_name: self
                 .credentials_cookie_name
@@ -1186,6 +1204,7 @@ pub struct Config<
     auth_page_name: String,
     jwt_page_name_extension: String,
     samesite_strict: bool,
+    httponly: bool,
     relogin_on_ip_change: bool,
     jwt_cookie_name: String,
     credentials_cookie_name: String,
@@ -1193,7 +1212,6 @@ pub struct Config<
     jwt_validity: Duration,
     credentials_cookie_validity: Duration,
     cookie_path: String,
-    // `TODO`: cfg - cargo features
 }
 impl<
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -1366,9 +1384,10 @@ impl<
                                     config.ip(addr.ip()),
                                 );
                                 let header_value = format!(
-                                    "{}={}; Secure; HttpOnly; SameSite={}; Max-Age={}; Path={}",
+                                    "{}={}; Secure{}; SameSite={}; Max-Age={}; Path={}",
                                     config.jwt_cookie_name,
                                     jwt,
+                                    if config.httponly { "; HttpOnly" } else { "" },
                                     if config.samesite_strict {
                                         "Strict"
                                     } else {
