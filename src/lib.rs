@@ -1259,8 +1259,10 @@ impl<
     /// refresh.
     ///
     /// To log in, use JavaScript's `fetch` with method POST or PUT to the `auth_page_name`,
-    /// with the username on the first line and
-    /// the password on the second.
+    /// with the username length on the first lines, then on the second line,
+    /// the username concatenated with the password without any space.
+    /// The rest of the body (after username length) is considered to be the password (it can
+    /// contains newlines).
     ///
     /// To log out, `fetch` DELETE to `auth_page_name`.
     ///
