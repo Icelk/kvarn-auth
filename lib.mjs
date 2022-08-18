@@ -8,7 +8,7 @@ export async function login(username, password, authPath = "/auth") {
     let te = new TextEncoder()
     // to get the UTF-8 string length
     let encodedUsername = te.encode(username)
-    return await fetch(authPath, { method: "PUT", body: `${encodedUsername.length + 1}\n${username}\n${password}` })
+    return await fetch(authPath, { method: "PUT", body: `${encodedUsername.length}\n${username}${password}` })
 }
 /**
  * @param authPage{string} the path where the authentication backend code is mounted to
