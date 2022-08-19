@@ -1434,11 +1434,8 @@ impl<
                                 .map(extract_cookie_value)
                                 .map_or(false, |v| !v.is_empty());
                             let encoding = req.headers_mut().remove("accept-encoding");
-                            utils::replace_header_static(
-                                req.headers_mut(),
-                                "accept-encoding",
-                                "identity",
-                            );
+                            req.headers_mut()
+                                .insert("accept-encoding", HeaderValue::from_static("identity"));
 
                             remove_cookie(req, credentials_cookie_name);
                             remove_cookie(req, jwt_cookie_name);
@@ -1460,11 +1457,7 @@ impl<
                                 );
                             }
                             if let Some(encoding) = encoding {
-                                utils::replace_header(
-                                    req.headers_mut(),
-                                    "accept-encoding",
-                                    encoding,
-                                );
+                                req.headers_mut().insert("accept-encoding", encoding);
                             }
 
                             let mut fat_response = FatResponse::no_cache(response.response);
@@ -1580,7 +1573,8 @@ impl<
                 }
 
                 let encoding = req.headers_mut().remove("accept-encoding");
-                utils::replace_header_static(req.headers_mut(), "accept-encoding", "identity");
+                req.headers_mut()
+                    .insert("accept-encoding", HeaderValue::from_static("identity"));
 
                 let mut response = kvarn::handle_cache(req, addr, host).await;
                 response.response.headers_mut().append(
@@ -1590,7 +1584,7 @@ impl<
                 );
 
                 if let Some(encoding) = encoding {
-                    utils::replace_header(req.headers_mut(), "accept-encoding", encoding);
+                    req.headers_mut().insert("accept-encoding", encoding);
                 }
 
                 let mut fat_response = FatResponse::no_cache(response.response);
