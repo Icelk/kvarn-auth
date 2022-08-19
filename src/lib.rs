@@ -1,7 +1,6 @@
 // See https://doc.rust-lang.org/beta/unstable-book/language-features/doc-cfg.html & https://github.com/rust-lang/rust/pull/89596
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-
 #![allow(dead_code)]
 use std::borrow::Cow;
 use std::future::Future;
@@ -1686,25 +1685,23 @@ impl<
                     );
                     let body =
                         some_or_return!(std::str::from_utf8(&body).ok(), StatusCode::BAD_REQUEST);
-                    let mut lines = body.lines();
-                    let username_length = some_or_return!(
-                        lines.next(),
+                    let (username_length, credentials) = some_or_return!(
+                        body.split_once('\n'),
                         StatusCode::BAD_REQUEST,
                         "the first line needs to be the username's length in bytes"
                     );
-                    let username_length_len = username_length.len();
                     let username_length: usize = some_or_return!(
                         username_length.parse().ok(),
                         StatusCode::BAD_REQUEST,
                         "the first line needs to be the username's length in bytes"
                     );
                     let username = some_or_return!(
-                        body.get(username_length_len..username_length_len + username_length),
+                        credentials.get(..username_length),
                         StatusCode::BAD_REQUEST,
                         "the username length was invalid"
                     );
                     let password = some_or_return!(
-                        body.get(username_length_len + username_length..),
+                        credentials.get(username_length..),
                         StatusCode::BAD_REQUEST,
                         "the username length was invalid; couldn't read password"
                     );
