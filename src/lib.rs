@@ -711,6 +711,7 @@ impl<T: Serialize + DeserializeOwned> Validation<T> {
                 };
                 AuthData::Structured(or_unauthorized!(serde_json::from_value(v).ok()))
             }
+            "e" => AuthData::None,
             _ => return Self::Unauthorized,
         };
         Self::Authorized(data)
