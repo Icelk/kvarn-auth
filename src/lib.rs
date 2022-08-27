@@ -1090,12 +1090,15 @@ impl Builder {
     }
     /// Show this page when the user isn't logged in.
     ///
+    /// This guarantees nobody can view any pages which starts with [`Self::with_cookie_path`]
+    /// without being logged in.
+    ///
     /// Please also specify [`Self::with_cookie_path`], as else `auth_page` will be shown instead
     /// of every other page when not logged in.
     ///
     /// # Panics
     ///
-    /// Panics if `show_auth_page_when_unauthorized` cannot be converted into an
+    /// Panics if `show_auth_page_when_unauthorized` cannot be converted into a [`kvarn::HeaderValue`].
     /// [`kvarn::prelude::Uri`].
     pub fn with_show_auth_page_when_unauthorized(mut self, auth_page: impl Into<String>) -> Self {
         let s = auth_page.into();
