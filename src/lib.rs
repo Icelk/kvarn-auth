@@ -1361,7 +1361,24 @@ impl<
                                 && req.uri().path() != auth_page_name =>
                         {
                             show_auth_page_when_unauthorized.as_ref().map(|path| {
-                                Uri::try_from(path).expect("invalid bytes in auth path")
+                                let uri = req.uri();
+                                {
+                                    let scheme = uri.scheme().map_or("", uri::Scheme::as_str);
+                                    let authority =
+                                        uri.authority().map_or("", uri::Authority::as_str);
+                                    let bytes = build_bytes!(
+                                        scheme.as_bytes(),
+                                        if uri.scheme().is_some() {
+                                            &b"://"[..]
+                                        } else {
+                                            &[]
+                                        },
+                                        authority.as_bytes(),
+                                        path.as_bytes()
+                                    );
+                                    Uri::from_maybe_shared(bytes)
+                                        .expect("invalid bytes in auth path")
+                                }
                             })
                         }
                         AuthState::Missing => None,
