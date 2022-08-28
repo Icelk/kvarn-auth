@@ -52,7 +52,7 @@ jobs:
               uses: actions-rs/cargo@v1
               with:
                   command: clippy
-                  args: --no-default-features --features RSA -- -D warnings
+                  args: --no-default-features --features rsa -- -D warnings
 
             - name: Checking doc references
               uses: Icelk/rustdoc-link-check@v1
