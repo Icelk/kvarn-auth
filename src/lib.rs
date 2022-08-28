@@ -532,7 +532,14 @@ impl<'a> Validate for &'a ComputedAlgo {
             #[cfg(feature = "ecdsa")]
             ComputedAlgo::EcdsaP256 { public_key, .. } => {
                 let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
-                public_key.verify(data, &sig).map_err(|_| ())
+                if let Some(ip) = ip {
+                    let mut buf = Vec::with_capacity(data.len() + 16);
+                    buf.extend_from_slice(data);
+                    buf.extend_from_slice(IpBytes::from(ip).as_ref());
+                    public_key.verify(&buf, &sig).map_err(|_| ())
+                } else {
+                    public_key.verify(data, &sig).map_err(|_| ())
+                }
             }
         }
     }
