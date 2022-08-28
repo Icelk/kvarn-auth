@@ -805,7 +805,7 @@ enum ComputedAlgo {
     #[cfg(feature = "hmac")]
     HmacSha256 {
         secret: Vec<u8>,
-        credentials_key: chacha20::cipher::CipherKey<chacha20::ChaCha12>,
+        credentials_key: chacha20::cipher::Key<chacha20::ChaCha12>,
     },
     #[cfg(feature = "rsa")]
     RSASha256 {
@@ -816,7 +816,7 @@ enum ComputedAlgo {
     EcdsaP256 {
         private_key: p256::ecdsa::SigningKey,
         public_key: p256::ecdsa::VerifyingKey,
-        credentials_key: chacha20::cipher::CipherKey<chacha20::ChaCha12>,
+        credentials_key: chacha20::cipher::Key<chacha20::ChaCha12>,
     },
 }
 impl ComputedAlgo {
