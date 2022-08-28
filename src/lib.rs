@@ -909,9 +909,10 @@ impl<'a> CredentialsStore<'a> {
 pub enum ValidationAlgo {
     /// Validate RSA-signed JWTs.
     #[cfg(feature = "rsa")]
-    RSASha256 { 
+    RSASha256 {
         /// The RSA public key.
-        public_key: rsa::RsaPublicKey },
+        public_key: rsa::RsaPublicKey,
+    },
     /// Validate ecdsa-signed JWTs.
     #[cfg(feature = "ecdsa")]
     EcdsaP256 {
@@ -1050,7 +1051,7 @@ impl From<CryptoAlgo> for ComputedAlgo {
 }
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // this is just the user-facing algo selector, it quickly gets
-                                     // converted to a smaller enum
+// converted to a smaller enum
 /// The cryptographic algorithm to use to ensure the authenticity of the data.
 ///
 /// I recommend `ecdsa`, as it's the fastest and has support for validation mode.
@@ -1059,15 +1060,16 @@ impl From<CryptoAlgo> for ComputedAlgo {
 pub enum CryptoAlgo {
     /// Sign using Hmac.
     #[cfg(feature = "hmac")]
-    HmacSha256 { 
+    HmacSha256 {
         /// The Hmac secret to sign with.
-        secret: Vec<u8> },
+        secret: Vec<u8>,
+    },
     /// Sign using RSA.
     #[cfg(feature = "rsa")]
-    RSASha256 { 
-                /// The RSA public key to sign with.
-
-        private_key: rsa::RsaPrivateKey },
+    RSASha256 {
+        /// The RSA public key to sign with.
+        private_key: rsa::RsaPrivateKey,
+    },
     #[cfg(feature = "ecdsa")]
     /// Sign using Ecdsa.
     ///
