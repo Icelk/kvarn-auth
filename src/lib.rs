@@ -558,24 +558,22 @@ impl<'a> Validate for &'a Mode {
         }
     }
 }
-#[cfg(all(test, feature = "hmac"))]
+#[cfg(all(test, feature = "ecdsa"))]
 impl<'a> Validate for &'a [u8] {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
-        // Hmac can take a key of any length
-        let mut hmac = Hmac::<sha2::Sha256>::new_from_slice(self).unwrap();
-        hmac.update(data);
+        let public_key = ecdsa_sk(self).verifying_key();
+        let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
         if let Some(ip) = ip {
-            hmac.update(IpBytes::from(ip).as_ref());
-        }
-        let hash = hmac.finalize().into_bytes();
-        if &*hash == signature {
-            Ok(())
+            let mut buf = Vec::with_capacity(data.len() + 16);
+            buf.extend_from_slice(data);
+            buf.extend_from_slice(IpBytes::from(ip).as_ref());
+            public_key.verify(&buf, &sig).map_err(|_| ())
         } else {
-            Err(())
+            public_key.verify(data, &sig).map_err(|_| ())
         }
     }
 }
-#[cfg(all(test, feature = "hmac"))]
+#[cfg(all(test, feature = "ecdsa"))]
 impl<'a, const LEN: usize> Validate for &'a [u8; LEN] {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         (&self[..]).validate(data, signature, ip)
@@ -1766,21 +1764,21 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    static HEADER: &[u8] = r#"{"alg":"HS256"}"#.as_bytes();
-
+    #[cfg(feature = "ecdsa")]
     fn test_computed_algo(secret: &[u8]) -> ComputedAlgo {
-        CryptoAlgo::HmacSha256 {
+        CryptoAlgo::EcdsaP256 {
             secret: secret.to_vec(),
         }
         .into()
     }
 
     #[test]
+    #[cfg(feature = "structured")]
     fn serde() {
         let mut map = HashMap::new();
         map.insert("loggedInAs".to_owned(), "admin".to_owned());
         let d = AuthData::Structured(map);
-        let token = d.into_jwt(&test_computed_algo(b"secretkey"), HEADER, 60, None);
+        let token = d.into_jwt_with_default_header(&test_computed_algo(b"secretkey"), 60, None);
 
         let v = Validation::<HashMap<String, String>>::from_jwt(&token, b"secretkey", None);
         match v {
@@ -1793,12 +1791,13 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(all(feature = "ecdsa", feature = "structured"))]
     fn tampering_1() {
         let mut map = HashMap::new();
         map.insert("loggedInAs".to_owned(), "admin".to_owned());
         let d = AuthData::Structured(map);
         // eyJhbGciOiJIUzI1NiJ9.eyJfX3ZhcmlhbnQiOiJzIiwiZXhwIjoxNjU5NDc3MjA4LCJpYXQiOjE2NTk0NzcxNDgsImxvZ2dlZEluQXMiOiJhZG1pbiJ9.p4V5nMMHYbri-na4aEPJzVIMb2U1XhEH9RmL8Hurra4
-        let _token = d.into_jwt(&test_computed_algo(b"secretkey"), HEADER, 60, None);
+        let _token = d.into_jwt_with_default_header(&test_computed_algo(b"secretkey"), 60, None);
 
         // changed `loggedInAs` to `superuser`
         let tampered_token = "eyJhbGciOiJIUzI1NiJ9.eyJfX3ZhcmlhbnQiOiJzIiwiZXhwIjoxNjU5NDc3MjA4LCJpYXQiOjE2NTk0NzcxNDgsImxvZ2dlZEluQXMiOiJzdXBlcnVzZXIifQ.p4V5nMMHYbri-na4aEPJzVIMb2U1XhEH9RmL8Hurra4";
@@ -1810,34 +1809,22 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(feature = "ecdsa")]
     fn tampering_2() {
-        let mut map = HashMap::new();
-        map.insert("loggedInAs".to_owned(), "user".to_owned());
-        let d = AuthData::Structured(map);
-        let _token = d.into_jwt(&test_computed_algo(b"secretkey"), HEADER, 60, None);
+        let d = AuthData::<()>::Text("user".to_owned());
+        let _token = d.into_jwt_with_default_header(&test_computed_algo(b"secretkey"), 60, None);
 
         let mut map = HashMap::new();
         map.insert("loggedInAs".to_owned(), "admin".to_owned());
         let d = AuthData::Structured(map);
-        let tampered_token = d.into_jwt(
-            &test_computed_algo(b"the hacker's secret"),
-            HEADER,
-            60,
-            None,
-        );
+        let tampered_token =
+            d.into_jwt_with_default_header(&test_computed_algo(b"the hacker's secret"), 60, None);
 
         let v =
             Validation::<HashMap<String, String>>::from_jwt(&tampered_token, b"secretkey", None);
         match v {
             Validation::Authorized(_) => panic!("should be unauthorized"),
             Validation::Unauthorized => {}
-        }
-    }
-    #[test]
-    fn p256_hash_key() {
-        for _ in 0..1000 {
-            let secret: [u8; 32] = rand::random();
-            let _key = p256::ecdsa::SigningKey::from_bytes(&secret).unwrap();
         }
     }
 }
