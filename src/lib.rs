@@ -1,33 +1,126 @@
+//! A fast, simple, and customizable authentication extension for use in [Kvarn](https://kvarn.org).
+//! It's impossible to shot yourself in your foot!
+//!
+//! It provides a [JWT](https://wikipedia.org/wiki/JSON_Web_Token) implementation with support for
+//! persistent logins and validation servers.
+//!
+//! # Validation servers
+//!
+//! An important feature of this library is validation servers.
+//! This enables a deployment of `kvarn-auth` to multiple different physical servers,
+//! without sharing the private key which can sign anybody in.
+//! This is achieved by using fast asymmetric cryptography.
+//! See [`ecdsa_sk`] for more info.
+//!
+//! # Persistent logins
+//!
+//! Along with the usual JWT cookie, `kvarn-auth` sends a credentials cookie.
+//! It contains the user's credentials encrypted using the secret/private key of the server.
+//! This allows for automatic renewal (using Kvarn's excellent extension system) when the JWT has
+//! expired. The credentials cookie is encrypted to avoid XSS attacks stealing the user's password,
+//! which the user probably reused on other websites; this is an effort to help users.
+//!
+//! You can enable [`Builder::with_force_relog_on_ip_change`] to make any cookie stealing useless.
+//! We embed the user's IP in the JWT and credentials and only allow them if the IP is the same.
+//! This may be annoying for the users (especially if your user-base is predominantly on mobile),
+//! but greatly decreases the risk of account theft. So probably use it for banking :)
+//!
+//! ```
+//! # use kvarn::prelude::*;
+//! // please use a strong random secret (>1024bits of entropy to be safe)
+//! let secret =b"this secret protects all the JWTs and the credentials".to_vec();
+//! let mut accounts: HashMap<String, String> = HashMap::new();
+//! accounts.insert("icelk".into(), "password".into());
+//! let auth_config = kvarn_auth::Builder::new()
+//!     .with_cookie_path("/demo/")
+//!     .with_auth_page_name("/demo/auth")
+//!     .with_show_auth_page_when_unauthorized("/demo/login.")
+//!     .build::<(), _, _>(
+//!         move |user, password, _addr, _req| {
+//!             let v = if accounts.get(user).map_or(false, |pass| pass == password) {
+//!                 kvarn_auth::Validation::Authorized(kvarn_auth::AuthData::None)
+//!             } else {
+//!                 kvarn_auth::Validation::Unauthorized
+//!             };
+//!             core::future::ready(v)
+//!         },
+//!         kvarn_auth::CryptoAlgo::EcdsaP256 { secret },
+//!     );
+//!
+//! let mut extensions = kvarn::Extensions::new();
+//!
+//! auth_config.mount(&mut extensions);
+//! let login_status = auth_config.login_status();
+//!
+//! extensions.add_prepare_single(
+//!     "/api",
+//!     prepare!(
+//!     req,
+//!     host,
+//!     _path,
+//!     addr,
+//!     move |login_status: kvarn_auth::LoginStatusClosure<()>| {
+//!         let auth_data =
+//!             if let kvarn_auth::Validation::Authorized(ad) =
+//!                 login_status(req, addr)
+//!         {
+//!             ad
+//!         } else {
+//!             return default_error_response(
+//!                 StatusCode::UNAUTHORIZED,
+//!                 host,
+//!                 Some("log in at `/demo/login.html`"),
+//!             )
+//!             .await;
+//!         };
+//!         // continue with your API, with a guarantee
+//!         FatResponse::no_cache(Response::new(Bytes::new()))
+//!     }),
+//! );
+//! ```
+
 // See https://doc.rust-lang.org/beta/unstable-book/language-features/doc-cfg.html & https://github.com/rust-lang/rust/pull/89596
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(dead_code)]
+#![deny(missing_docs)]
 use std::borrow::Cow;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// #[cfg(not(feature = "structured"))]
+#[cfg(not(feature = "structured"))]
 mod unescape;
 
-#[cfg(feature = "chacha20")]
-use chacha20::cipher::{NewCipher, StreamCipher};
 use futures::FutureExt;
+
+#[cfg(any(feature = "ecdsa", feature = "hmac"))]
+use rand::Rng;
+#[cfg(any(feature = "ecdsa", feature = "rsa", feature = "hmac"))]
+use sha2::Digest;
+
+#[cfg(feature = "structured")]
+use serde::{de::DeserializeOwned, Serialize};
+
+#[cfg(feature = "chacha20")]
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 #[cfg(feature = "hmac")]
 use hmac::{Hmac, Mac};
 #[cfg(feature = "ecdsa")]
 use p256::ecdsa::signature::{Signer, Verifier};
-#[cfg(any(feature = "ecdsa", feature = "hmac"))]
-use rand::Rng;
-#[cfg(feature = "rsa")]
-pub use rsa;
 #[cfg(feature = "rsa")]
 use rsa::PublicKey;
-#[cfg(feature = "structured")]
-use serde::{de::DeserializeOwned, Serialize};
-#[cfg(any(feature = "ecdsa", feature = "rsa", feature = "hmac"))]
-use sha2::Digest;
+
+#[cfg(feature = "chacha20")]
+pub use chacha20;
+#[cfg(feature = "hmac")]
+pub use hmac;
+#[cfg(feature = "ecdsa")]
+pub use p256;
+#[cfg(feature = "rsa")]
+pub use rsa;
+
 #[cfg(not(any(feature = "ecdsa", feature = "rsa", feature = "hmac")))]
 compile_error!("At least one algorithm has to be enabled.");
 
@@ -118,11 +211,21 @@ fn remove_set_cookie(
             .expect("a user-supplied cookie_name or the cookie_path contains illegal bytes for use in a header"),
     );
 }
+/// The data in the JWT.
+///
+/// This stores any data attached to a logged in user.
+/// This data is not secret - it can be ready by the receiver.
+/// The authenticity of the message is however always conserved (as long as your secret hasn't
+/// leaked).
 #[derive(Debug)]
 pub enum AuthData<T: Serialize + DeserializeOwned = ()> {
+    /// No data.
     None,
+    /// Text data.
     Text(String),
+    /// A number.
     Number(f64),
+    /// Text and a number.
     TextNumber(String, f64),
     /// Fields `iat`, `exp`, and `__variant` are overriden and will not be visible when the
     /// JWT is decoded.
@@ -412,6 +515,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         self.into_jwt(signing_algo, header, seconds_before_expiry, ip)
     }
 }
+/// The state of the user in question.
 #[derive(Debug)]
 pub enum Validation<T: Serialize + DeserializeOwned> {
     /// This can come from multiple sources, including but not limited to:
@@ -423,6 +527,8 @@ pub enum Validation<T: Serialize + DeserializeOwned> {
     /// - failed to parse JSON
     /// - expiry date is not included
     Unauthorized,
+    /// The user is authorized with the provided data.
+    /// The data is guaranteed to be what you authorized.
     Authorized(AuthData<T>),
 }
 
@@ -795,13 +901,21 @@ impl<'a> CredentialsStore<'a> {
     }
 }
 
+/// The algorithm used when running in validation mode.
+///
+/// `hmac` isn't available, as that doesn't use asymmetric cryptography.
 #[derive(Debug)]
 #[cfg(any(feature = "rsa", feature = "ecdsa"))]
 pub enum ValidationAlgo {
+    /// Validate RSA-signed JWTs.
     #[cfg(feature = "rsa")]
-    RSASha256 { public_key: rsa::RsaPublicKey },
+    RSASha256 { 
+        /// The RSA public key.
+        public_key: rsa::RsaPublicKey },
+    /// Validate ecdsa-signed JWTs.
     #[cfg(feature = "ecdsa")]
     EcdsaP256 {
+        /// The ecdsa public key.
         public_key: p256::ecdsa::VerifyingKey,
     },
 }
@@ -937,16 +1051,32 @@ impl From<CryptoAlgo> for ComputedAlgo {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // this is just the user-facing algo selector, it quickly gets
                                      // converted to a smaller enum
+/// The cryptographic algorithm to use to ensure the authenticity of the data.
+///
+/// I recommend `ecdsa`, as it's the fastest and has support for validation mode.
+/// `hmac` is the most common algorithm used on the web right now, so it could be useful for
+/// compatibility.
 pub enum CryptoAlgo {
+    /// Sign using Hmac.
     #[cfg(feature = "hmac")]
-    HmacSha256 { secret: Vec<u8> },
+    HmacSha256 { 
+        /// The Hmac secret to sign with.
+        secret: Vec<u8> },
+    /// Sign using RSA.
     #[cfg(feature = "rsa")]
-    RSASha256 { private_key: rsa::RsaPrivateKey },
+    RSASha256 { 
+                /// The RSA public key to sign with.
+
+        private_key: rsa::RsaPrivateKey },
     #[cfg(feature = "ecdsa")]
+    /// Sign using Ecdsa.
+    ///
     /// This is the recommended algo, as it allows verification without the secret (see
     /// [`ecdsa_sk`] for more details on how to share the verification key) (RSA can also do this), is 1000x faster than
     /// RSA, and takes up 70% less space than RSA. It's also takes any byte array as a secret.
     EcdsaP256 {
+        /// The Ecdsa secret to sign with.
+        ///
         /// Does currently not correspond to PKCS#8 certificates.
         /// This can be anything you'd like.
         secret: Vec<u8>,
@@ -993,6 +1123,8 @@ pub struct Builder {
     cookie_path: Option<String>,
 }
 impl Builder {
+    /// Create a new builder.
+    /// Use [`Self::build`] or [`Self::build_validate`] to get a [`Config`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -1103,7 +1235,7 @@ impl Builder {
     ///
     /// # Panics
     ///
-    /// Panics if `show_auth_page_when_unauthorized` cannot be converted into a [`kvarn::HeaderValue`].
+    /// Panics if `show_auth_page_when_unauthorized` cannot be converted into a [`kvarn::prelude::HeaderValue`].
     /// [`kvarn::prelude::Uri`].
     pub fn with_show_auth_page_when_unauthorized(mut self, auth_page: impl Into<String>) -> Self {
         let s = auth_page.into();
@@ -1163,6 +1295,7 @@ impl Builder {
         };
         Arc::new(c)
     }
+    /// Build these settings into a [`Config`], which you then use for validation.
     pub fn build<
         T: Serialize + DeserializeOwned + Send + Sync,
         F: Fn(&str, &str, SocketAddr, &kvarn::FatRequest) -> Fut + Send + Sync,
@@ -1174,6 +1307,8 @@ impl Builder {
     ) -> Arc<Config<T, F, Fut>> {
         self._build(is_allowed, Mode::Sign(Arc::new(pk.into())))
     }
+    /// Build these settings into a [`Config`] built for validation.
+    /// See the [module-level documentation](self) for more info.
     #[allow(clippy::type_complexity)]
     #[cfg(any(feature = "rsa", feature = "ecdsa"))]
     pub fn build_validate(
@@ -1203,9 +1338,13 @@ impl Builder {
         self._build(placeholder, Mode::Validate(Arc::new(validation_key)))
     }
 }
+/// The type of [`Config::login_status`]. Use this in the type bounds of Kvarn's extensions.
 pub type LoginStatusClosure<T> = Arc<
     dyn Fn(&kvarn::FatRequest, kvarn::prelude::SocketAddr) -> Validation<T> + Send + Sync + 'static,
 >;
+/// The configured authentication. This can be attached to a Kvarn host using the [`Self::mount`]
+/// method. You can call [`Self::login_status`] to get a function to use in your extensions to
+/// check for authentication status.
 pub struct Config<
     T: Serialize + DeserializeOwned + Send + Sync,
     F: Fn(&str, &str, SocketAddr, &kvarn::FatRequest) -> Fut + Send + Sync,
