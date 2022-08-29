@@ -28,12 +28,14 @@
 //! ```
 //! # use kvarn::prelude::*;
 //! // please use a strong random secret (>1024bits of entropy to be safe)
-//! let secret =b"this secret protects all the JWTs and the credentials".to_vec();
+//! let secret = b"this secret protects all the JWTs and the credentials".to_vec();
 //! let mut accounts: HashMap<String, String> = HashMap::new();
 //! accounts.insert("icelk".into(), "password".into());
 //! let auth_config = kvarn_auth::Builder::new()
+//!     // the authentication's scope is limited to routes starting with `/demo/`.
 //!     .with_cookie_path("/demo/")
 //!     .with_auth_page_name("/demo/auth")
+//!     // according to Kvarn's internal redirects, `/demo/login.` is shorthand for `/demo/login.html`
 //!     .with_show_auth_page_when_unauthorized("/demo/login.")
 //!     .build::<(), _, _>(
 //!         move |user, password, _addr, _req| {
@@ -53,7 +55,7 @@
 //! let login_status = auth_config.login_status();
 //!
 //! extensions.add_prepare_single(
-//!     "/api",
+//!     "/demo/api",
 //!     prepare!(
 //!     req,
 //!     host,
