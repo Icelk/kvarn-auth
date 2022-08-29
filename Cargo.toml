@@ -2,13 +2,20 @@
 name = "kvarn-auth"
 version = "0.1.0"
 edition = "2021"
+description = "JWT authentication for Kvarn"
+readme = "README.md"
+homepage = "https://github.com/Icelk/kvarn-auth/"
+repository = "https://github.com/Icelk/kvarn-auth/"
+license = "Apache-2.0"
+keywords = ["authentication", "jwt", "token", "kvarn"]
+categories = ["authentication", "algorithms", "web-programming"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 base64 = "0.13"
 futures = { version = "0.3", default-features = false, features = ["std"] }
-kvarn = { version = "0.4.1", path = "../kvarn", default-features = false }
+kvarn = { version = "0.5", path = "../kvarn", default-features = false }
 log = "0.4"
 rand = "0.8.5"
 
