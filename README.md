@@ -40,6 +40,12 @@ We embed the user's IP in the JWT and credentials and only allow them if the IP 
 This may be annoying for the users (especially if your user-base is predominantly on mobile),
 but greatly decreases the risk of account theft. So probably use it for banking :)
 
+# Versions
+
+-   0.1.x - `kvarn v0.5`
+
+# Example
+
 ```rust
 # use kvarn::prelude::*;
 // please use a strong random secret (>1024bits of entropy to be safe)
