@@ -34,7 +34,7 @@ jobs:
               run: cargo clippy --no-default-features --features rsa -- -D warnings
 
             - name: Checking doc references
-              uses: Icelk/rustdoc-link-check@v1
+              uses: Icelk/rustdoc-link-check@v2
               with:
                   private: true
             - name: Testing project
