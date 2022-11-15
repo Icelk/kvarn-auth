@@ -288,7 +288,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                         rsa::PaddingScheme::PKCS1v15Sign {
                             hash: Some(rsa::Hash::SHA2_256),
                         },
-                        &*hash,
+                        &hash,
                     )
                     .expect("failed to sign JWT with RSA key");
                 s.push('.');
