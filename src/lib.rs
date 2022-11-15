@@ -1017,7 +1017,7 @@ pub enum CryptoAlgo {
 #[cfg(feature = "ecdsa")]
 pub fn ecdsa_sk(secret: &[u8]) -> p256::ecdsa::SigningKey {
     let mut hasher = sha2::Sha256::new();
-    hasher.update(&secret);
+    hasher.update(secret);
     let hash = hasher.finalize();
     p256::ecdsa::SigningKey::from_bytes(&hash).expect("failed to construct a Ecdsa key")
 }
