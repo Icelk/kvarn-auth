@@ -13,7 +13,7 @@ categories = ["authentication", "algorithms", "web-programming"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-base64 = "0.13"
+base64 = "0.20"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 kvarn = { version = "0.5", path = "../kvarn", default-features = false }
 log = "0.4"
@@ -24,11 +24,11 @@ serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 
 # hash
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true, features = ["oid"] }
 # encryption / decryption
 chacha20 = { version = "0.9", optional = true }
 # signers / verifiers
-rsa = { version = "0.6", optional = true }
+rsa = { version = "0.7", optional = true }
 p256 = { version = "0.11", default-features = false, features = ["ecdsa"], optional = true }
 hmac = { version = "0.12", optional = true }
 

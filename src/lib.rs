@@ -55,6 +55,14 @@ pub trait DeserializeOwned {}
 #[cfg(not(feature = "structured"))]
 impl<T> DeserializeOwned for T {}
 
+const BASE64_ENGINE: base64::engine::fast_portable::FastPortable =
+    base64::engine::fast_portable::FastPortable::from(
+        &base64::alphabet::URL_SAFE,
+        base64::engine::fast_portable::FastPortableConfig::new()
+            .with_encode_padding(false)
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
+
 fn seconds_since_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -180,8 +188,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         seconds_before_expiry: u64,
         ip: Option<IpAddr>,
     ) -> String {
-        let mut s = String::new();
-        base64::encode_config_buf(header, base64::URL_SAFE_NO_PAD, &mut s);
+        let mut s = base64::encode_engine(header, &BASE64_ENGINE);
         let mut map = match self {
             Self::None => {
                 let mut map = serde_json::Map::new();
@@ -257,8 +264,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         let value = serde_json::Value::Object(map);
         let payload = value.to_string();
         s.push('.');
-        base64::encode_config_buf(payload.as_bytes(), base64::URL_SAFE_NO_PAD, &mut s);
-
+        base64::encode_engine_string(payload.as_bytes(), &mut s, &BASE64_ENGINE);
         match signing_algo {
             #[cfg(feature = "hmac")]
             ComputedAlgo::HmacSha256 { secret, .. } => {
@@ -270,7 +276,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 }
                 let sig = hmac.finalize().into_bytes();
                 s.push('.');
-                base64::encode_config_buf(sig, base64::URL_SAFE_NO_PAD, &mut s);
+                base64::encode_engine_string(sig, &mut s, &BASE64_ENGINE);
             }
             #[cfg(feature = "rsa")]
             ComputedAlgo::RSASha256 {
@@ -285,14 +291,12 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 let hash = hasher.finalize();
                 let signature = private_key
                     .sign(
-                        rsa::PaddingScheme::PKCS1v15Sign {
-                            hash: Some(rsa::Hash::SHA2_256),
-                        },
+                        rsa::PaddingScheme::new_pkcs1v15_sign::<sha2::Sha256>(),
                         &hash,
                     )
                     .expect("failed to sign JWT with RSA key");
                 s.push('.');
-                base64::encode_config_buf(signature, base64::URL_SAFE_NO_PAD, &mut s);
+                base64::encode_engine_string(signature, &mut s, &BASE64_ENGINE);
             }
             #[cfg(feature = "ecdsa")]
             ComputedAlgo::EcdsaP256 { private_key, .. } => {
@@ -304,7 +308,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                     private_key.sign(s.as_bytes())
                 };
                 s.push('.');
-                base64::encode_config_buf(signature, base64::URL_SAFE_NO_PAD, &mut s);
+                base64::encode_engine_string(signature, &mut s, &BASE64_ENGINE);
             }
         }
         s
@@ -497,9 +501,7 @@ impl<'a> Validate for &'a ValidationAlgo {
                 let hash = hasher.finalize();
                 public_key
                     .verify(
-                        rsa::PaddingScheme::PKCS1v15Sign {
-                            hash: Some(rsa::Hash::SHA2_256),
-                        },
+                        rsa::PaddingScheme::new_pkcs1v15_sign::<sha2::Sha256>(),
                         &hash,
                         signature,
                     )
@@ -532,9 +534,7 @@ impl<'a> Validate for &'a ComputedAlgo {
                 let hash = hasher.finalize();
                 public_key
                     .verify(
-                        rsa::PaddingScheme::PKCS1v15Sign {
-                            hash: Some(rsa::Hash::SHA2_256),
-                        },
+                        rsa::PaddingScheme::new_pkcs1v15_sign::<sha2::Sha256>(),
                         &hash,
                         signature,
                     )
@@ -623,14 +623,14 @@ fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<serd
         return None;
     }
     let signature_input = &s[..parts[0].len() + 1 + parts[1].len()];
-    let remote_signature = base64::decode_config(parts[2], base64::URL_SAFE_NO_PAD).ok()?;
+    let remote_signature = base64::decode_engine(parts[2], &BASE64_ENGINE).ok()?;
     if validate
         .validate(signature_input.as_bytes(), &remote_signature, ip)
         .is_err()
     {
         return None;
     }
-    let payload = base64::decode_config(parts[1], base64::URL_SAFE_NO_PAD)
+    let payload = base64::decode_engine(parts[1], &BASE64_ENGINE)
         .ok()
         .and_then(|p| String::from_utf8(p).ok())?;
     let mut payload_value: serde_json::Value = payload.parse().ok()?;
@@ -1596,10 +1596,10 @@ impl<
                 let credentials =
                     some_or_remove_cookie!(credentials_cookie.map(extract_cookie_value));
                 let mut rsa_credentials = Vec::new();
-                some_or_remove_cookie!(base64::decode_config_buf(
+                some_or_remove_cookie!(base64::decode_engine_vec(
                     credentials,
-                    base64::URL_SAFE_NO_PAD,
                     &mut rsa_credentials,
+                    &BASE64_ENGINE
                 )
                 .ok());
                 let decrypted =
@@ -1799,10 +1799,10 @@ impl<
                     });
                     let encrypted = signing_algo.encrypt(&credentials_bin);
                     let mut credentials_header = String::new();
-                    base64::encode_config_buf(
+                    base64::encode_engine_string(
                         &encrypted,
-                        base64::URL_SAFE_NO_PAD,
                         &mut credentials_header,
+                        &BASE64_ENGINE,
                     );
                     let credentials_header = new_credentials_cookie(&credentials_header);
                     FatResponse::no_cache(
