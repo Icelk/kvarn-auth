@@ -1040,6 +1040,7 @@ pub struct Builder {
     jwt_cookie_validity: Option<Duration>,
     credentials_cookie_validity: Option<Duration>,
     cookie_path: Option<String>,
+    read_x_real_ip_header: Option<bool>,
 }
 impl Builder {
     /// Create a new builder.
@@ -1176,6 +1177,12 @@ impl Builder {
         self.credentials_cookie_validity = Some(valid_for);
         self
     }
+    /// Reads the IP from the header `x-real-ip` instead of the connection IP.
+    /// This is useful if the authentication is behind a reverse proxy.
+    pub fn with_ip_from_header(mut self) -> Self {
+        self.read_x_real_ip_header = Some(true);
+        self
+    }
 
     fn _build<
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -1211,6 +1218,7 @@ impl Builder {
                 .credentials_cookie_validity
                 .unwrap_or_else(|| Duration::from_secs(60 * 60 * 24 * 365)),
             cookie_path: self.cookie_path.unwrap_or_else(|| String::from("/")),
+            read_x_real_ip_header: self.read_x_real_ip_header.unwrap_or(false),
         };
         Arc::new(c)
     }
@@ -1282,6 +1290,7 @@ pub struct Config<
     jwt_validity: Duration,
     credentials_cookie_validity: Duration,
     cookie_path: String,
+    read_x_real_ip_header: bool,
 }
 impl<
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -1394,28 +1403,104 @@ impl<
                 }
             }
         };
-        #[allow(clippy::type_complexity)]
-        let validate: Box<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync> =
-            Box::new(validate);
+        type Validate = Arc<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync>;
+        let validate: Validate = Arc::new(validate);
         let prime_jwt_refresh_page = Uri::try_from(&jwt_refresh_page)
             .expect("we converted all non-header safe values to hyphens");
+        let x_real_ip = self.read_x_real_ip_header;
+        fn check_addr(
+            req: &FatRequest,
+            addr: SocketAddr,
+            x_real_ip: bool,
+        ) -> Result<SocketAddr, ()> {
+            if x_real_ip {
+                if let Some(addr) = req
+                    .headers()
+                    .get("x-real-ip")
+                    .and_then(|header| header.to_str().ok())
+                    .and_then(|header| header.parse::<IpAddr>().ok())
+                    .map(|ip| SocketAddr::new(ip, 0))
+                {
+                    Ok(addr)
+                } else {
+                    Err(())
+                }
+            } else {
+                Ok(addr)
+            }
+        }
+        async fn resolve_addr(
+            req: &FatRequest,
+            addr: SocketAddr,
+            x_real_ip: bool,
+            host: &Host,
+        ) -> Result<SocketAddr, FatResponse> {
+            if let Ok(addr) = check_addr(req, addr, x_real_ip) {
+                Ok(addr)
+            } else {
+                Err(default_error_response(StatusCode::BAD_REQUEST, host, Some("the authentication extected to be behind a reverse proxy and to get the `x-real-ip` header.")).await)
+            }
+        }
 
-        #[allow(clippy::type_complexity)]
+        if show_auth_page_when_unauthorized.is_some() {
+            let cookie_path = cookie_path.clone();
+            let validate = Arc::clone(&validate);
+            extensions.add_package(
+                package!(
+                    response,
+                    req,
+                    _host,
+                    addr,
+                    move |cookie_path: String, validate: Validate, x_real_ip: bool| {
+                        let addr = match check_addr(req, addr, *x_real_ip) {
+                            Ok(a) => a,
+                            Err(()) => {
+                                // same as Incorrect
+                                response
+                                    .headers_mut()
+                                    .insert("client-cache", HeaderValue::from_static("no-cache"));
+                                return;
+                            }
+                        };
+                        if req.uri().path().starts_with(cookie_path) {
+                            let state: AuthState = validate(req, addr);
+                            match state {
+                                AuthState::Missing | AuthState::Incorrect => {
+                                    response.headers_mut().insert(
+                                        "client-cache",
+                                        HeaderValue::from_static("no-cache"),
+                                    );
+                                }
+                                AuthState::Authorized => {}
+                            }
+                        }
+                    }
+                ),
+                Id::new(-7, "don't cache authentication website on client"),
+            )
+        }
+
         extensions.add_prime(
             prime!(
                 req,
                 _host,
                 addr,
-                move |validate: Box<dyn Fn(&FatRequest, SocketAddr) -> AuthState + Send + Sync>,
+                move |validate: Validate,
                       show_auth_page_when_unauthorized: Option<String>,
                       auth_page_name: String,
                       cookie_path: String,
-                      prime_jwt_refresh_page: Uri| {
+                      prime_jwt_refresh_page: Uri,
+                      x_real_ip: bool| {
                     if !req.uri().path().starts_with(cookie_path)
                         || req.uri().path() == auth_page_name
                     {
                         return None;
                     }
+                    let addr = match check_addr(req, addr, *x_real_ip) {
+                        Ok(a) => a,
+                        // same as Incorrect
+                        Err(()) => return Some(prime_jwt_refresh_page.clone()),
+                    };
                     let state: AuthState = validate(req, addr);
                     match state {
                         AuthState::Authorized => None,
@@ -1462,6 +1547,11 @@ impl<
             move |username: &str, password: &str, addr: SocketAddr, req: &FatRequest| {
                 let signing_algo = jwt_signing_algo.clone();
                 let config = config.clone();
+                let addr = match check_addr(req, addr, x_real_ip) {
+                    Ok(a) => a,
+                    // same as Incorrect
+                    Err(()) => return Box::pin(async { None }),
+                };
                 let fut = (config.is_allowed)(username, password, addr, req).then(
                     move |data| async move {
                         match data {
@@ -1554,6 +1644,11 @@ impl<
                 }
 
                 let req: &mut FatRequest = req;
+
+                let addr = match resolve_addr(req, addr, x_real_ip, host).await {
+                    Ok(a) => a,
+                    Err(resp) => return resp,
+                };
 
                 if let Some(header) = req.headers().get("x-kvarn-auth-processed") {
                     error!(
@@ -1737,6 +1832,10 @@ impl<
                             }
                         };
                     }
+                    let addr = match resolve_addr(req, addr, x_real_ip, host).await {
+                        Ok(a) => a,
+                        Err(resp) => return resp,
+                    };
 
                     match *req.method() {
                         // continue with the normal control flow
