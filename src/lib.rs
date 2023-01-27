@@ -1438,7 +1438,19 @@ impl<
             if let Ok(addr) = check_addr(req, addr, x_real_ip) {
                 Ok(addr)
             } else {
-                Err(default_error_response(StatusCode::BAD_REQUEST, host, Some("the authentication extected to be behind a reverse proxy and to get the `x-real-ip` header.")).await)
+                error!(
+                    "URGENT: `x-real-ip` header wasn't found or not valid. \
+                    Malicious users could spoof it."
+                );
+                Err(default_error_response(
+                    StatusCode::BAD_REQUEST,
+                    host,
+                    Some(
+                        "the authentication extected to be behind \
+                        a reverse proxy and to get the `x-real-ip` header.",
+                    ),
+                )
+                .await)
             }
         }
 
