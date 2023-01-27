@@ -78,7 +78,7 @@ fn get_cookie_with_header_pos<'a, T>(
     name: &str,
 ) -> Option<(&'a str, usize, usize)> {
     let mut cookie = None;
-    let filter = format!("{}=", name);
+    let filter = format!("{name}=");
     for (header_pos, header) in req
         .headers()
         .get_all("cookie")
