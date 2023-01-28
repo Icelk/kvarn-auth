@@ -1546,6 +1546,8 @@ impl<
                     }
                 }
             ),
+            // the priority has to be below the priority of `http_to_https_redirect`,
+            // else the user might not be using HTTPS!
             extensions::Id::new(8432, "auth JWT renewal").no_override(),
         );
         let refresh_signing_algo = signing_algo.clone();
