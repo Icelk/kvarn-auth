@@ -1488,7 +1488,7 @@ impl<
                         }
                     }
                 ),
-                Id::new(-7, "don't cache authentication website on client"),
+                Id::new(-7, "don't cache authentication website on client").no_override(),
             )
         }
 
