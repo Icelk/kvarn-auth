@@ -22,7 +22,7 @@ See it and it's docs for more details.
 # Validation servers
 
 An important feature of this library is validation servers.
-This enables a deployment of `kvarn-auth` to multiple different physicervers,
+This enables a deployment of `kvarn-auth` to multiple different physical servers,
 without sharing the private key which can sign anybody in.
 This is achieved by using fast asymmetric cryptography.
 See [`ecdsa_sk`] for more info.
