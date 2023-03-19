@@ -1650,7 +1650,7 @@ impl<
 
                             let mut fat_response = FatResponse::no_cache(response.response);
                             if let Some(f) = response.future {
-                                fat_response = fat_response.with_future(f);
+                                fat_response = fat_response.with_future_and_maybe_len(f);
                             }
                             return fat_response;
                         }
@@ -1681,7 +1681,7 @@ impl<
                         let response = kvarn::handle_cache(req, addr, host).await;
                         let mut fat_response = FatResponse::no_cache(response.response);
                         if let Some(f) = response.future {
-                            fat_response = fat_response.with_future(f);
+                            fat_response = fat_response.with_future_and_maybe_len(f);
                         }
                         return fat_response;
                     } else {
@@ -1782,7 +1782,7 @@ impl<
 
                 let mut fat_response = FatResponse::no_cache(response.response);
                 if let Some(f) = response.future {
-                    fat_response = fat_response.with_future(f);
+                    fat_response = fat_response.with_future_and_maybe_len(f);
                 }
                 fat_response
             }
