@@ -1871,7 +1871,7 @@ impl<
                     }
 
                     let body = some_or_return!(
-                        req.body_mut().read_to_bytes().await.ok(),
+                        req.body_mut().read_to_bytes(1024 * 4).await.ok(),
                         StatusCode::BAD_REQUEST
                     );
                     let body =
