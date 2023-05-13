@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(not(feature = "structured"))]
 mod unescape;
 
+use base64::Engine;
 use futures::FutureExt;
 
 #[cfg(any(feature = "ecdsa", feature = "hmac"))]
@@ -30,7 +31,7 @@ use hmac::{Hmac, Mac};
 #[cfg(feature = "ecdsa")]
 use p256::ecdsa::signature::{Signer, Verifier};
 #[cfg(feature = "rsa")]
-use rsa::PublicKey;
+use rsa::RsaPublicKey;
 
 #[cfg(feature = "chacha20")]
 pub use chacha20;
@@ -55,10 +56,10 @@ pub trait DeserializeOwned {}
 #[cfg(not(feature = "structured"))]
 impl<T> DeserializeOwned for T {}
 
-const BASE64_ENGINE: base64::engine::fast_portable::FastPortable =
-    base64::engine::fast_portable::FastPortable::from(
+const BASE64_ENGINE: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::GeneralPurpose::new(
         &base64::alphabet::URL_SAFE,
-        base64::engine::fast_portable::FastPortableConfig::new()
+        base64::engine::general_purpose::GeneralPurposeConfig::new()
             .with_encode_padding(false)
             .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
     );
@@ -188,7 +189,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         seconds_before_expiry: u64,
         ip: Option<IpAddr>,
     ) -> String {
-        let mut s = base64::encode_engine(header, &BASE64_ENGINE);
+        let mut s = BASE64_ENGINE.encode(header);
         let mut map = match self {
             Self::None => {
                 let mut map = serde_json::Map::new();
@@ -264,7 +265,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         let value = serde_json::Value::Object(map);
         let payload = value.to_string();
         s.push('.');
-        base64::encode_engine_string(payload.as_bytes(), &mut s, &BASE64_ENGINE);
+        BASE64_ENGINE.encode_string(payload.as_bytes(), &mut s);
         match signing_algo {
             #[cfg(feature = "hmac")]
             ComputedAlgo::HmacSha256 { secret, .. } => {
@@ -276,7 +277,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 }
                 let sig = hmac.finalize().into_bytes();
                 s.push('.');
-                base64::encode_engine_string(sig, &mut s, &BASE64_ENGINE);
+                BASE64_ENGINE.encode_string(sig, &mut s);
             }
             #[cfg(feature = "rsa")]
             ComputedAlgo::RSASha256 {
@@ -290,17 +291,14 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 }
                 let hash = hasher.finalize();
                 let signature = private_key
-                    .sign(
-                        rsa::PaddingScheme::new_pkcs1v15_sign::<sha2::Sha256>(),
-                        &hash,
-                    )
+                    .sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hash)
                     .expect("failed to sign JWT with RSA key");
                 s.push('.');
-                base64::encode_engine_string(signature, &mut s, &BASE64_ENGINE);
+                BASE64_ENGINE.encode_string(signature, &mut s);
             }
             #[cfg(feature = "ecdsa")]
             ComputedAlgo::EcdsaP256 { private_key, .. } => {
-                let signature = if let Some(ip) = ip {
+                let signature: p256::ecdsa::DerSignature = if let Some(ip) = ip {
                     let mut v = s.as_bytes().to_vec();
                     v.extend_from_slice(IpBytes::from(ip).as_ref());
                     private_key.sign(&v)
@@ -308,7 +306,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                     private_key.sign(s.as_bytes())
                 };
                 s.push('.');
-                base64::encode_engine_string(signature, &mut s, &BASE64_ENGINE);
+                BASE64_ENGINE.encode_string(signature, &mut s);
             }
         }
         s
@@ -325,7 +323,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         seconds_before_expiry: u64,
         ip: Option<IpAddr>,
     ) -> String {
-        let mut s = base64::encode_engine(header, &BASE64_ENGINE);
+        let mut s = BASE64_ENGINE.encode(header);
         let mut json = String::new();
         json.push_str(r#"{"__variant":"#);
         match self {
@@ -363,7 +361,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
         json.push('}');
         let payload = json;
         s.push('.');
-        base64::encode_engine_string(payload.as_bytes(), &mut s, &BASE64_ENGINE);
+        BASE64_ENGINE.encode_string(payload.as_bytes(), &mut s);
 
         match signing_algo {
             #[cfg(feature = "hmac")]
@@ -376,7 +374,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 }
                 let sig = hmac.finalize().into_bytes();
                 s.push('.');
-                base64::encode_engine_string(sig, &mut s, &BASE64_ENGINE);
+                BASE64_ENGINE.encode_string(sig, &mut s);
             }
             #[cfg(feature = "rsa")]
             ComputedAlgo::RSASha256 {
@@ -390,17 +388,14 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                 }
                 let hash = hasher.finalize();
                 let signature = private_key
-                    .sign(
-                        rsa::PaddingScheme::new_pkcs1v15_sign::<sha2::Sha256>(),
-                        &hash,
-                    )
+                    .sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hash)
                     .expect("failed to sign JWT with RSA key");
                 s.push('.');
-                base64::encode_engine_string(signature, &mut s, &BASE64_ENGINE);
+                BASE64_ENGINE.encode_string(signature, &mut s);
             }
             #[cfg(feature = "ecdsa")]
             ComputedAlgo::EcdsaP256 { private_key, .. } => {
-                let signature = if let Some(ip) = ip {
+                let signature: p256::ecdsa::Signature = if let Some(ip) = ip {
                     let mut v = s.as_bytes().to_vec();
                     v.extend_from_slice(IpBytes::from(ip).as_ref());
                     private_key.sign(&v)
@@ -408,7 +403,7 @@ impl<T: Serialize + DeserializeOwned> AuthData<T> {
                     private_key.sign(s.as_bytes())
                 };
                 s.push('.');
-                base64::encode_engine_string(signature, &mut s, &BASE64_ENGINE);
+                BASE64_ENGINE.encode_string(signature.to_der(), &mut s);
             }
         }
         s
@@ -497,16 +492,14 @@ impl<'a> Validate for &'a ValidationAlgo {
                 }
                 let hash = hasher.finalize();
                 public_key
-                    .verify(
-                        rsa::PaddingScheme::new_pkcs1v15_sign::<sha2::Sha256>(),
-                        &hash,
-                        signature,
-                    )
+                    .verify(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, signature)
                     .map_err(|_| ())
             }
             #[cfg(feature = "ecdsa")]
             ValidationAlgo::EcdsaP256 { public_key } => {
-                let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
+                println!("begin");
+                let sig = p256::ecdsa::Signature::from_der(signature).map_err(|_| ())?;
+                println!("Got sig");
                 public_key.verify(data, &sig).map_err(|_| ())
             }
         }
@@ -530,11 +523,7 @@ impl<'a> Validate for &'a ComputedAlgo {
                 }
                 let hash = hasher.finalize();
                 public_key
-                    .verify(
-                        rsa::PaddingScheme::new_pkcs1v15_sign::<sha2::Sha256>(),
-                        &hash,
-                        signature,
-                    )
+                    .verify(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, signature)
                     .map_err(|_| ())
             }
             #[cfg(feature = "hmac")]
@@ -554,7 +543,7 @@ impl<'a> Validate for &'a ComputedAlgo {
             }
             #[cfg(feature = "ecdsa")]
             ComputedAlgo::EcdsaP256 { public_key, .. } => {
-                let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
+                let sig = p256::ecdsa::Signature::from_der(signature).map_err(|_| ())?;
                 if let Some(ip) = ip {
                     let mut buf = Vec::with_capacity(data.len() + 16);
                     buf.extend_from_slice(data);
@@ -584,8 +573,9 @@ impl<'a> Validate for &'a Mode {
 #[cfg(all(test, feature = "ecdsa"))]
 impl<'a> Validate for &'a [u8] {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
-        let public_key = ecdsa_sk(self).verifying_key();
-        let sig = p256::ecdsa::Signature::try_from(signature).map_err(|_| ())?;
+        let signing = ecdsa_sk(self);
+        let public_key = signing.verifying_key();
+        let sig = p256::ecdsa::Signature::from_der(signature).map_err(|_| ())?;
         if let Some(ip) = ip {
             let mut buf = Vec::with_capacity(data.len() + 16);
             buf.extend_from_slice(data);
@@ -620,16 +610,20 @@ fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<serd
         return None;
     }
     let signature_input = &s[..parts[0].len() + 1 + parts[1].len()];
-    let remote_signature = base64::decode_engine(parts[2], &BASE64_ENGINE).ok()?;
+    let remote_signature = BASE64_ENGINE.decode(parts[2]).ok()?;
+    println!("got sig: {signature_input:?} {:?}", remote_signature.len());
     if validate
         .validate(signature_input.as_bytes(), &remote_signature, ip)
         .is_err()
     {
+        println!("failed val");
         return None;
     }
-    let payload = base64::decode_engine(parts[1], &BASE64_ENGINE)
+    let payload = BASE64_ENGINE
+        .decode(parts[1])
         .ok()
         .and_then(|p| String::from_utf8(p).ok())?;
+    println!("got payload");
     let mut payload_value: serde_json::Value = payload.parse().ok()?;
     let payload = payload_value.as_object_mut()?;
     let exp = payload.get("exp").and_then(|v| v.as_u64())?;
@@ -648,14 +642,15 @@ fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<JwtD
         return None;
     }
     let signature_input = &s[..parts[0].len() + 1 + parts[1].len()];
-    let remote_signature = base64::decode_engine(parts[2], &BASE64_ENGINE).ok()?;
+    let remote_signature = BASE64_ENGINE.decode(parts[2]).ok()?;
     if validate
         .validate(signature_input.as_bytes(), &remote_signature, ip)
         .is_err()
     {
         return None;
     }
-    let payload = base64::decode_engine(parts[1], &BASE64_ENGINE)
+    let payload = BASE64_ENGINE
+        .decode(parts[1])
         .ok()
         .and_then(|p| String::from_utf8(p).ok())?;
     let mut entries = payload.strip_prefix('{')?.strip_suffix('}')?.trim();
@@ -828,7 +823,7 @@ pub enum ValidationAlgo {
     #[cfg(feature = "rsa")]
     RSASha256 {
         /// The RSA public key.
-        public_key: rsa::RsaPublicKey,
+        public_key: RsaPublicKey,
     },
     /// Validate ecdsa-signed JWTs.
     #[cfg(feature = "ecdsa")]
@@ -847,7 +842,7 @@ enum ComputedAlgo {
     #[cfg(feature = "rsa")]
     RSASha256 {
         private_key: Box<rsa::RsaPrivateKey>,
-        public_key: Box<rsa::RsaPublicKey>,
+        public_key: Box<RsaPublicKey>,
     },
     #[cfg(feature = "ecdsa")]
     EcdsaP256 {
@@ -864,11 +859,7 @@ impl ComputedAlgo {
                 private_key: _,
                 public_key,
             } => public_key
-                .encrypt(
-                    &mut rand::thread_rng(),
-                    rsa::PaddingScheme::PKCS1v15Encrypt,
-                    b,
-                )
+                .encrypt(&mut rand::thread_rng(), rsa::Pkcs1v15Encrypt, b)
                 .expect("failed to encrypt with RSA"),
             #[cfg(feature = "hmac")]
             Self::HmacSha256 {
@@ -906,7 +897,7 @@ impl ComputedAlgo {
                 private_key,
                 public_key: _,
             } => private_key
-                .decrypt(rsa::PaddingScheme::PKCS1v15Encrypt, b)
+                .decrypt(rsa::Pkcs1v15Encrypt, b)
                 .map(Cow::Owned)
                 .ok(),
             #[cfg(feature = "hmac")]
@@ -947,7 +938,7 @@ impl From<CryptoAlgo> for ComputedAlgo {
             },
             #[cfg(feature = "rsa")]
             CryptoAlgo::RSASha256 { private_key } => Self::RSASha256 {
-                public_key: Box::new(rsa::RsaPublicKey::from(&private_key)),
+                public_key: Box::new(RsaPublicKey::from(&private_key)),
                 private_key: Box::new(private_key),
             },
             #[cfg(feature = "ecdsa")]
@@ -958,7 +949,7 @@ impl From<CryptoAlgo> for ComputedAlgo {
                 let private_key = p256::ecdsa::SigningKey::from_bytes(&hash)
                     .expect("failed to construct a Ecdsa key");
                 Self::EcdsaP256 {
-                    public_key: private_key.verifying_key(),
+                    public_key: *private_key.verifying_key(),
                     private_key,
                     credentials_key: hash,
                 }
@@ -1702,12 +1693,9 @@ impl<
                 let credentials =
                     some_or_remove_cookie!(credentials_cookie.map(extract_cookie_value));
                 let mut rsa_credentials = Vec::new();
-                some_or_remove_cookie!(base64::decode_engine_vec(
-                    credentials,
-                    &mut rsa_credentials,
-                    &BASE64_ENGINE
-                )
-                .ok());
+                some_or_remove_cookie!(BASE64_ENGINE
+                    .decode_vec(credentials, &mut rsa_credentials)
+                    .ok());
                 let decrypted =
                     some_or_remove_cookie!(refresh_signing_algo.decrypt(&mut rsa_credentials));
                 let (credentials, credentials_ip) =
@@ -1909,11 +1897,7 @@ impl<
                     });
                     let encrypted = signing_algo.encrypt(&credentials_bin);
                     let mut credentials_header = String::new();
-                    base64::encode_engine_string(
-                        &encrypted,
-                        &mut credentials_header,
-                        &BASE64_ENGINE,
-                    );
+                    BASE64_ENGINE.encode_string(&encrypted, &mut credentials_header);
                     let credentials_header = new_credentials_cookie(&credentials_header);
                     FatResponse::no_cache(
                         Response::builder()
@@ -1930,7 +1914,7 @@ impl<
     }
 }
 
-#[cfg(tests)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1950,6 +1934,8 @@ mod tests {
         map.insert("loggedInAs".to_owned(), "admin".to_owned());
         let d = AuthData::Structured(map);
         let token = d.into_jwt_with_default_header(&test_computed_algo(b"secretkey"), 60, None);
+
+        println!("Token: {token:?}");
 
         let v = Validation::<HashMap<String, String>>::from_jwt(&token, b"secretkey", None);
         match v {
