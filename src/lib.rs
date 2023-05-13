@@ -497,9 +497,7 @@ impl<'a> Validate for &'a ValidationAlgo {
             }
             #[cfg(feature = "ecdsa")]
             ValidationAlgo::EcdsaP256 { public_key } => {
-                println!("begin");
                 let sig = p256::ecdsa::Signature::from_der(signature).map_err(|_| ())?;
-                println!("Got sig");
                 public_key.verify(data, &sig).map_err(|_| ())
             }
         }
@@ -611,19 +609,16 @@ fn validate(s: &str, validate: impl Validate, ip: Option<IpAddr>) -> Option<serd
     }
     let signature_input = &s[..parts[0].len() + 1 + parts[1].len()];
     let remote_signature = BASE64_ENGINE.decode(parts[2]).ok()?;
-    println!("got sig: {signature_input:?} {:?}", remote_signature.len());
     if validate
         .validate(signature_input.as_bytes(), &remote_signature, ip)
         .is_err()
     {
-        println!("failed val");
         return None;
     }
     let payload = BASE64_ENGINE
         .decode(parts[1])
         .ok()
         .and_then(|p| String::from_utf8(p).ok())?;
-    println!("got payload");
     let mut payload_value: serde_json::Value = payload.parse().ok()?;
     let payload = payload_value.as_object_mut()?;
     let exp = payload.get("exp").and_then(|v| v.as_u64())?;
@@ -1934,8 +1929,6 @@ mod tests {
         map.insert("loggedInAs".to_owned(), "admin".to_owned());
         let d = AuthData::Structured(map);
         let token = d.into_jwt_with_default_header(&test_computed_algo(b"secretkey"), 60, None);
-
-        println!("Token: {token:?}");
 
         let v = Validation::<HashMap<String, String>>::from_jwt(&token, b"secretkey", None);
         match v {
