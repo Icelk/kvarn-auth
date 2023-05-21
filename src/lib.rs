@@ -1182,7 +1182,10 @@ impl Builder {
         let httponly = self.httponly.unwrap_or(true);
         let relogin_on_ip_change = self.relogin_on_ip_change.unwrap_or(false);
         if !httponly && !relogin_on_ip_change {
-            log::warn!("HttpOnly not set and relogin_on_ip_change not set. In case of XSS attacks, the credentials could be leaked");
+            log::warn!(
+                "HttpOnly not set and relogin_on_ip_change not set. \
+                In case of XSS attacks, the session token could be leaked"
+            );
         }
         let c = Config {
             mode,
