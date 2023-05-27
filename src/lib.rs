@@ -13,6 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(not(feature = "structured"))]
 mod unescape;
 
+#[cfg(feature = "integration-fs")]
+pub mod integrations;
+
 use base64::Engine;
 use futures::FutureExt;
 
