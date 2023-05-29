@@ -33,11 +33,15 @@ impl<T> UserValidation<T> {
     }
 }
 /// Gets the user from a request.
-pub struct GetFsUser<T: Default + Send + Sync> {
+pub struct GetFsUser<T, U> {
     pub login: Login,
-    data: Arc<FsUserCollection<T>>,
+    data: Arc<FsUserCollection<T, U>>,
 }
-impl<T: Default + DeserializeOwned + Serialize + Send + Sync> GetFsUser<T> {
+impl<
+        T: DeserializeOwned + Serialize + Send + Sync,
+        U: DeserializeOwned + Serialize + Send + Sync,
+    > GetFsUser<T, U>
+{
     /// Get the user and it's data.
     pub fn get_user(
         &self,
@@ -82,9 +86,11 @@ struct CreationUser {
     username: CompactString,
     email: CompactString,
     password: CompactString,
+    #[serde(flatten)]
+    other: serde_json::Value,
 }
 #[derive(Deserialize, Serialize, Clone)]
-pub struct User<T: Default + Send + Sync> {
+pub struct User<T> {
     pub username: CompactString,
     pub email: CompactString,
     pub admin: bool,
@@ -103,39 +109,56 @@ struct QueriedUser {
     pub admin: bool,
 }
 #[derive(Serialize, Deserialize)]
-pub struct FsUserCollection<T: Default + Send + Sync> {
+pub struct FsUserCollection<T, U> {
     pub users: DashMap<CompactString, User<T>>,
+    pub other_data: U,
     #[serde(skip)]
     pub path: CompactString,
 }
-impl<T: Default + DeserializeOwned + Serialize + Send + Sync> FsUserCollection<T> {
-    pub fn empty_at(path: impl AsRef<str>) -> Self {
+impl<
+        T: DeserializeOwned + Serialize + Send + Sync,
+        U: DeserializeOwned + Serialize + Send + Sync,
+    > FsUserCollection<T, U>
+{
+    pub fn empty_at(path: impl AsRef<str>, other_data: U) -> Self {
         Self {
             users: DashMap::new(),
+            other_data,
+
             path: path.as_ref().to_compact_string(),
         }
     }
-    pub async fn read(path: impl AsRef<str>) -> Option<Self> {
+    pub async fn read(path: impl AsRef<str>) -> Option<Result<Self, String>> {
         let path = path.as_ref().to_compact_string();
         let file = kvarn::read_file(&path, None).await?;
-        let mut me: Self = bincode::serde::decode_from_slice(&file, bincode::config::standard())
-            .ok()
-            .map(|(v, _)| v)?;
-        me.path = path;
-        Some(me)
+        let me: Result<Self, _> =
+            bincode::serde::decode_from_slice(&file, bincode::config::standard()).map(|(v, _)| v);
+        match me {
+            Ok(mut me) => {
+                me.path = path;
+                Some(Ok(me))
+            }
+            Err(err) => Some(Err(format!("Failed to load the file at {path}: {err}"))),
+        }
     }
 }
 /// `async Fn(username, email) -> bool`
-pub type CreationAllowed =
-    Arc<dyn Fn(CompactString, CompactString) -> RetFut<'static, bool> + Send + Sync>;
-pub fn mount_fs_integration<T: Default + DeserializeOwned + Serialize + Send + Sync + 'static>(
+pub type CreationAllowed<T> = Arc<
+    dyn Fn(CompactString, CompactString, serde_json::Value) -> RetFut<'static, Option<T>>
+        + Send
+        + Sync,
+>;
+pub fn mount_fs_integration<
+    T: DeserializeOwned + Serialize + Send + Sync + 'static,
+    U: Serialize + DeserializeOwned + Send + Sync + 'static,
+>(
     path: impl AsRef<str>,
     extensions: &mut Extensions,
-    creation_allowed: CreationAllowed,
-    users: Arc<FsUserCollection<T>>,
+    creation_allowed: CreationAllowed<T>,
+    users: Arc<FsUserCollection<T, U>>,
     key: CryptoAlgo,
     always_admin: HashSet<CompactString>,
-) -> GetFsUser<T> {
+) -> GetFsUser<T, U> {
     let path = path.as_ref();
     let account_path = format_compact!("{path}account");
     let login_path = format_compact!("{path}login");
@@ -181,14 +204,19 @@ pub fn mount_fs_integration<T: Default + DeserializeOwned + Serialize + Send + S
     };
 
     let login = auth.login_status();
-    struct Ext<T: Default + DeserializeOwned + Serialize + Send + Sync> {
-        creation_allowed: CreationAllowed,
-        users: Arc<FsUserCollection<T>>,
+    struct Ext<
+        T: DeserializeOwned + Serialize + Send + Sync,
+        U: DeserializeOwned + Serialize + Send + Sync,
+    > {
+        creation_allowed: CreationAllowed<T>,
+        users: Arc<FsUserCollection<T, U>>,
         always_admin: HashSet<CompactString>,
         login: Login,
     }
-    impl<T: Default + DeserializeOwned + Serialize + Send + Sync> kvarn::extensions::PrepareCall
-        for Ext<T>
+    impl<
+            T: DeserializeOwned + Serialize + Send + Sync,
+            U: DeserializeOwned + Serialize + Send + Sync,
+        > kvarn::extensions::PrepareCall for Ext<T, U>
     {
         fn call<'a>(
             &'a self,
@@ -227,16 +255,22 @@ pub fn mount_fs_integration<T: Default + DeserializeOwned + Serialize + Send + S
 
                         let contains = { users.users.contains_key(&body.username) };
                         let allow = async {
-                            (creation_allowed)(body.username.clone(), body.email.clone()).await
+                            (creation_allowed)(
+                                body.username.clone(),
+                                body.email.clone(),
+                                body.other,
+                            )
+                            .await
                         };
-                        if contains || !(allow.await) {
+                        let opt = if contains { None } else { allow.await };
+                        let Some(data) = opt else {
                             return default_error_response(
                                 StatusCode::FORBIDDEN,
                                 host,
                                 Some("you aren't allowed to create an account"),
                             )
                             .await;
-                        }
+                        };
 
                         let salt: [u8; 16] = rand::Rng::gen(&mut rand::thread_rng());
 
@@ -251,7 +285,7 @@ pub fn mount_fs_integration<T: Default + DeserializeOwned + Serialize + Send + S
                             email: body.email.clone(),
                             admin: always_admin.contains(&body.username),
 
-                            data: T::default(),
+                            data,
 
                             ctime: DateTime(
                                 SystemTime::now()
