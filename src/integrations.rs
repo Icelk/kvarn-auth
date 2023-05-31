@@ -158,6 +158,7 @@ pub type CreationAllowed<T> = Arc<
         + Send
         + Sync,
 >;
+#[allow(clippy::too_many_arguments)]
 pub fn mount_fs_integration<
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
     U: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -168,15 +169,24 @@ pub fn mount_fs_integration<
     users: Arc<FsUserCollection<T, U>>,
     key: CryptoAlgo,
     always_admin: HashSet<CompactString>,
+    account_path: Option<impl AsRef<str>>,
+    login_path: Option<impl AsRef<str>>,
+    cookie_path: Option<impl AsRef<str>>,
 ) -> GetFsUser<T, U> {
     let path = path.as_ref();
-    let account_path = format_compact!("{path}account");
-    let login_path = format_compact!("{path}login");
+    let account_path = format_compact!(
+        "{path}{}",
+        account_path.as_ref().map_or("account", |s| s.as_ref())
+    );
+    let login_path = format_compact!(
+        "{path}{}",
+        login_path.as_ref().map_or("login", |s| s.as_ref())
+    );
 
     let auth = {
         let users = users.clone();
         Builder::new()
-            .with_cookie_path(path)
+            .with_cookie_path(cookie_path.as_ref().map_or(path, |s| s.as_ref()))
             .with_auth_page_name(login_path)
             .with_relaxed_httponly()
             .build(
