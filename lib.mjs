@@ -8,7 +8,10 @@ export async function login(username, password, authPath = "/auth") {
     let te = new TextEncoder()
     // to get the UTF-8 string length
     let encodedUsername = te.encode(username)
-    return await fetch(authPath, { method: "PUT", body: `${encodedUsername.length}\n${username}${password}` })
+    return await fetch(authPath, {
+        method: "PUT",
+        body: `${encodedUsername.length}\n${username}${password}`,
+    })
 }
 /**
  * @param authPage{string} the path where the authentication backend code is mounted to
@@ -23,11 +26,14 @@ export async function logout(authPath = "/auth") {
  * Else, this will always return `null`.
  *
  * @param authPage {string} the path where the authentication backend code is mounted to
- * @returns {null | string | number | [string, number] | any} The status of the logged in user, or null if none.
+ * @returns {null | string | number | [string, number] | any} The status of the logged in user, or null if none.
  */
 export function loginStatus(cookieName = "auth-jwt") {
     let cookies = document.cookie
     let index = cookies.indexOf(`${cookieName}=`)
+    if (index < 0) {
+        return null
+    }
     cookies = cookies.slice(index)
     let jwtCookie = cookies.split("; ")[0]
     let payload = jwtCookie.split(".")[1]
