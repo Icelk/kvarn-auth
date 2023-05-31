@@ -37,6 +37,14 @@ pub struct GetFsUser<T, U> {
     pub login: Login,
     data: Arc<FsUserCollection<T, U>>,
 }
+impl<T, U> Clone for GetFsUser<T, U> {
+    fn clone(&self) -> Self {
+        Self {
+            login: self.login.clone(),
+            data: self.data.clone(),
+        }
+    }
+}
 impl<
         T: DeserializeOwned + Serialize + Send + Sync,
         U: DeserializeOwned + Serialize + Send + Sync,
