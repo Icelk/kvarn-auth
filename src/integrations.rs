@@ -111,6 +111,7 @@ struct QueriedUser {
 #[derive(Serialize, Deserialize)]
 pub struct FsUserCollection<T, U> {
     pub users: DashMap<CompactString, User<T>>,
+    pub email_to_user: DashMap<CompactString, CompactString>,
     pub other_data: U,
     #[serde(skip)]
     pub path: CompactString,
@@ -123,6 +124,7 @@ impl<
     pub fn empty_at(path: impl AsRef<str>, other_data: U) -> Self {
         Self {
             users: DashMap::new(),
+            email_to_user: DashMap::new(),
             other_data,
 
             path: path.as_ref().to_compact_string(),
@@ -175,9 +177,13 @@ pub fn mount_fs_integration<
                     let password = password.to_compact_string();
                     let users = users.clone();
                     async move {
-                        let Some(user) = ({
-                            users.users.get(&user)
-                        }) else {
+                        let user = users.users.get(&user).or_else(|| {
+                            users
+                                .email_to_user
+                                .get(&user)
+                                .and_then(|user| users.users.get(user.value()))
+                        });
+                        let Some(user) = user else {
                             return Validation::Unauthorized;
                         };
 
@@ -253,7 +259,10 @@ pub fn mount_fs_integration<
                             ).await;
                         };
 
-                        let contains = { users.users.contains_key(&body.username) };
+                        let contains = {
+                            users.users.contains_key(&body.username)
+                                || users.email_to_user.contains_key(&body.email)
+                        };
                         let allow = async {
                             (creation_allowed)(
                                 body.username.clone(),
@@ -298,7 +307,9 @@ pub fn mount_fs_integration<
                             salt,
                         };
                         let (data, path) = {
-                            if users.users.contains_key(&body.username) {
+                            if users.users.contains_key(&body.username)
+                                || users.email_to_user.contains_key(&body.email)
+                            {
                                 return default_error_response(
                                     StatusCode::FORBIDDEN,
                                     host,
@@ -307,6 +318,9 @@ pub fn mount_fs_integration<
                                 .await;
                             }
                             users.users.insert(body.username.clone(), user);
+                            users
+                                .email_to_user
+                                .insert(body.email.clone(), body.username.clone());
 
                             (
                                 bincode::serde::encode_to_vec(
