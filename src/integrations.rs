@@ -151,6 +151,18 @@ impl<
             Err(err) => Some(Err(format!("Failed to load the file at {path}: {err}"))),
         }
     }
+    pub async fn write(&self) {
+        let (data, path) = {
+            (
+                bincode::serde::encode_to_vec(self, bincode::config::standard()).unwrap(),
+                self.path.clone(),
+            )
+        };
+
+        if let Err(err) = tokio::fs::write(path.as_str(), data).await {
+            error!("Failed to write user database to {path:?}: {err}");
+        }
+    }
 }
 /// `async Fn(username, email) -> bool`
 pub type CreationAllowed<T> = Arc<
@@ -324,35 +336,22 @@ pub fn mount_fs_integration<
                             hashed_password: hash,
                             salt,
                         };
-                        let (data, path) = {
-                            if users.users.contains_key(&body.username)
-                                || users.email_to_user.contains_key(&body.email)
-                            {
-                                return default_error_response(
-                                    StatusCode::FORBIDDEN,
-                                    host,
-                                    Some("you aren't allowed to create an account"),
-                                )
-                                .await;
-                            }
-                            users.users.insert(body.username.clone(), user);
-                            users
-                                .email_to_user
-                                .insert(body.email.clone(), body.username.clone());
-
-                            (
-                                bincode::serde::encode_to_vec(
-                                    &**users,
-                                    bincode::config::standard(),
-                                )
-                                .unwrap(),
-                                users.path.clone(),
+                        if users.users.contains_key(&body.username)
+                            || users.email_to_user.contains_key(&body.email)
+                        {
+                            return default_error_response(
+                                StatusCode::FORBIDDEN,
+                                host,
+                                Some("you aren't allowed to create an account"),
                             )
-                        };
-
-                        if let Err(err) = tokio::fs::write(path.as_str(), data).await {
-                            error!("Failed to write user database to {path:?}: {err}");
+                            .await;
                         }
+                        users.users.insert(body.username.clone(), user);
+                        users
+                            .email_to_user
+                            .insert(body.email.clone(), body.username.clone());
+
+                        users.write().await;
 
                         FatResponse::no_cache(Response::new(Bytes::new()))
                     }
