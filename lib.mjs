@@ -36,9 +36,14 @@ export function loginStatus(cookieName = "auth-jwt") {
     }
     cookies = cookies.slice(index)
     let jwtCookie = cookies.split("; ")[0]
-    let payload = jwtCookie.split(".")[1]
+    let payload = jwtCookie.split(".")[1] || ""
     let decoded = decodeURIComponent(escape(window.atob(payload)))
-    let data = JSON.parse(decoded)
+    let data
+    try {
+        data = JSON.parse(decoded)
+    } catch (_e) {
+        return null
+    }
     let variant = data["__variant"]
     if (variant === undefined) {
         if (data.num !== undefined && data.text !== undefined) {
