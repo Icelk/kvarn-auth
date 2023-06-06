@@ -8,7 +8,7 @@
 
 #![allow(missing_docs)]
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -164,13 +164,31 @@ impl<
         }
     }
 }
-/// `async Fn(username, email) -> bool`
+/// `Arc<async Fn(username, email) -> Option<User data>>`, disallowed if `None`
 pub type CreationAllowed<T> = Arc<
     dyn Fn(CompactString, CompactString, serde_json::Value) -> RetFut<'static, Option<T>>
         + Send
         + Sync,
 >;
-#[allow(clippy::too_many_arguments)]
+/// `Arc<async Fn(user, email, target_user_to_be_deleted, user_is_admin) -> delete?>`
+///
+/// Is only called if the deletion would normally be allowed (user tries to delete self, or user
+/// is admin).
+pub type AllowUserDeletion = Arc<
+    dyn Fn(CompactString, CompactString, CompactString, bool) -> RetFut<'static, bool>
+        + Send
+        + Sync,
+>;
+
+#[derive(Default)]
+pub struct FsIntegrationOptions {
+    pub always_admin: BTreeSet<CompactString>,
+    pub account_path: Option<CompactString>,
+    pub login_path: Option<CompactString>,
+    pub cookie_path: Option<CompactString>,
+    pub allow_user_deletion: Option<AllowUserDeletion>,
+}
+
 pub fn mount_fs_integration<
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
     U: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -180,25 +198,22 @@ pub fn mount_fs_integration<
     creation_allowed: CreationAllowed<T>,
     users: Arc<FsUserCollection<T, U>>,
     key: CryptoAlgo,
-    always_admin: HashSet<CompactString>,
-    account_path: Option<impl AsRef<str>>,
-    login_path: Option<impl AsRef<str>>,
-    cookie_path: Option<impl AsRef<str>>,
+    opts: FsIntegrationOptions,
 ) -> GetFsUser<T, U> {
     let path = path.as_ref();
     let account_path = format_compact!(
         "{path}{}",
-        account_path.as_ref().map_or("account", |s| s.as_ref())
+        opts.account_path.as_ref().map_or("account", |s| s.as_ref())
     );
     let login_path = format_compact!(
         "{path}{}",
-        login_path.as_ref().map_or("login", |s| s.as_ref())
+        opts.login_path.as_ref().map_or("login", |s| s.as_ref())
     );
 
     let auth = {
         let users = users.clone();
         Builder::new()
-            .with_cookie_path(cookie_path.as_ref().map_or(path, |s| s.as_ref()))
+            .with_cookie_path(opts.cookie_path.as_ref().map_or(path, |s| s.as_ref()))
             .with_auth_page_name(login_path)
             .with_relaxed_httponly()
             .build(
@@ -246,8 +261,9 @@ pub fn mount_fs_integration<
     > {
         creation_allowed: CreationAllowed<T>,
         users: Arc<FsUserCollection<T, U>>,
-        always_admin: HashSet<CompactString>,
         login: Login,
+        deletion: Option<AllowUserDeletion>,
+        always_admin: BTreeSet<CompactString>,
     }
     impl<
             T: DeserializeOwned + Serialize + Send + Sync,
@@ -265,8 +281,9 @@ pub fn mount_fs_integration<
                 let Self {
                     creation_allowed,
                     users,
-                    always_admin,
                     login,
+                    deletion,
+                    always_admin,
                 } = self;
                 match *req.method() {
                     Method::PUT => {
@@ -283,11 +300,13 @@ pub fn mount_fs_integration<
                                 StatusCode::BAD_REQUEST, host, Some("requires JSON body")
                             ).await;
                         };
-                        let Ok(body): Result<CreationUser, _> = serde_json::from_slice(&body) else {
+                        let Ok(mut body): Result<CreationUser, _> = serde_json::from_slice(&body) else {
                             return default_error_response(
                                 StatusCode::BAD_REQUEST, host, Some("missing parameters")
                             ).await;
                         };
+
+                        body.email = body.email.to_lowercase().to_compact_string();
 
                         let contains = {
                             users.users.contains_key(&body.username)
@@ -385,7 +404,7 @@ pub fn mount_fs_integration<
                         let Validation::Authorized(AuthData::Structured(
                             LoginData {
                                 username,
-                                email: _,
+                                email,
                                 admin,
                                 ctime: _,
                             },
@@ -417,9 +436,29 @@ pub fn mount_fs_integration<
                             target = &username;
                         }
 
-                        users.users.remove(target);
+                        let allow = if let Some(f) = deletion {
+                            f(
+                                username.to_compact_string(),
+                                email,
+                                target.to_compact_string(),
+                                admin,
+                            )
+                            .await
+                        } else {
+                            true
+                        };
+                        if allow {
+                            users.users.remove(target);
 
-                        FatResponse::no_cache(Response::new(Bytes::new()))
+                            FatResponse::no_cache(Response::new(Bytes::new()))
+                        } else {
+                            default_error_response(
+                                StatusCode::UNAUTHORIZED,
+                                host,
+                                Some("you weren't allowed to remove your account"),
+                            )
+                            .await
+                        }
                     }
                     _ => default_error_response(StatusCode::METHOD_NOT_ALLOWED, host, None).await,
                 }
@@ -429,10 +468,11 @@ pub fn mount_fs_integration<
     extensions.add_prepare_single(
         account_path,
         Box::new(Ext {
-            always_admin,
             creation_allowed,
             login,
             users: users.clone(),
+            deletion: opts.allow_user_deletion,
+            always_admin: opts.always_admin,
         }),
     );
     auth.mount(extensions);
