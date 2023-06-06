@@ -135,7 +135,7 @@ fn remove_set_cookie(
     let remove_cookie = format!(
         "{cookie_name}=\"\"; \
         Path={cookie_path}; \
-        Max-Age=1"
+        Max-Age=0"
     );
     response.headers_mut().append(
         "set-cookie",
