@@ -70,6 +70,26 @@ impl<
             _ => panic!("our AuthData is always Structured"),
         }
     }
+    /// Get the user and it's data as a mutable reference.
+    pub fn get_user_mut(
+        &self,
+        request: &FatRequest,
+        addr: SocketAddr,
+    ) -> UserValidation<dashmap::mapref::one::RefMut<CompactString, User<T>>> {
+        let validation = (self.login)(request, addr);
+        match validation {
+            Validation::Unauthorized => UserValidation::Unauthorized,
+            Validation::Authorized(AuthData::Structured(v)) => {
+                let Some(user) = self.data.users.get_mut(&v.username) else {
+                    warn!("User {} is authorized but doesn't exist in the DB", v.username);
+                    return UserValidation::Unauthorized;
+                };
+
+                UserValidation::Authorized(v, user)
+            }
+            _ => panic!("our AuthData is always Structured"),
+        }
+    }
 }
 
 /// Data used when logging in.
@@ -140,6 +160,7 @@ impl<
     }
     pub async fn read(path: impl AsRef<str>) -> Option<Result<Self, String>> {
         let path = path.as_ref().to_compact_string();
+        // `tokio-uring` support
         let file = kvarn::read_file(&path, None).await?;
         let me: Result<Self, _> =
             bincode::serde::decode_from_slice(&file, bincode::config::standard()).map(|(v, _)| v);
@@ -161,6 +182,70 @@ impl<
 
         if let Err(err) = tokio::fs::write(path.as_str(), data).await {
             error!("Failed to write user database to {path:?}: {err}");
+        }
+    }
+
+    pub fn remove_user(&self, username: &str) -> bool {
+        let user = self.users.remove(username);
+        if let Some((_, user)) = user {
+            self.email_to_user.remove(&user.email);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Change types of all data. Useful for "upgrading" the data scheme
+    /// Please keep in mind that the `other_data` passwed to `map_user_data` is not upgraded
+    pub fn map<
+        NewT: DeserializeOwned + Serialize + Send + Sync,
+        NewU: DeserializeOwned + Serialize + Send + Sync,
+    >(
+        self,
+        map_other_data: impl FnOnce(U, &DashMap<CompactString, User<NewT>>) -> NewU,
+        mut map_user_data: impl FnMut(T, &U) -> NewT,
+    ) -> FsUserCollection<NewT, NewU> {
+        let Self {
+            users,
+            email_to_user,
+            other_data,
+            path,
+        } = self;
+
+        let users = users
+            .into_iter()
+            .map(|(k, v)| {
+                let User {
+                    username,
+                    email,
+                    admin,
+                    data,
+                    ctime,
+                    hashed_password,
+                    salt,
+                } = v;
+                let data = map_user_data(data, &other_data);
+                (
+                    k,
+                    User {
+                        username,
+                        email,
+                        admin,
+                        data,
+                        ctime,
+                        hashed_password,
+                        salt,
+                    },
+                )
+            })
+            .collect();
+        let other_data = map_other_data(other_data, &users);
+
+        FsUserCollection {
+            users,
+            email_to_user,
+            other_data,
+            path,
         }
     }
 }
@@ -419,7 +504,7 @@ pub fn mount_fs_integration<
                             .map(HeaderValue::to_str)
                             .and_then(Result::ok);
 
-                        let target;
+                        let mut target;
 
                         if let Some(header) = header {
                             if !admin {
@@ -430,7 +515,7 @@ pub fn mount_fs_integration<
                                 )
                                 .await;
                             }
-                            target = header;
+                            target = header.to_compact_string();
                         } else {
                             if admin {
                                 return default_error_response(
@@ -440,7 +525,13 @@ pub fn mount_fs_integration<
                                 )
                                 .await;
                             }
-                            target = &username;
+                            target = username.clone()
+                        }
+
+                        if !users.users.contains_key(&target) {
+                            if let Some(u) = users.email_to_user.get(&target) {
+                                target = u.value().to_compact_string();
+                            }
                         }
 
                         let allow = if let Some(f) = deletion {
@@ -454,10 +545,8 @@ pub fn mount_fs_integration<
                         } else {
                             true
                         };
-                        if allow {
-                            let user = users.users.remove(target);
-                            if let Some((_, user)) = user {
-                                users.email_to_user.remove(&user.email);
+                        let r = if allow {
+                            if users.remove_user(&target) {
                                 FatResponse::no_cache(Response::new(Bytes::new()))
                             } else {
                                 default_error_response(
@@ -474,7 +563,9 @@ pub fn mount_fs_integration<
                                 Some("you weren't allowed to remove your account"),
                             )
                             .await
-                        }
+                        };
+                        users.write().await;
+                        r
                     }
                     _ => default_error_response(StatusCode::METHOD_NOT_ALLOWED, host, None).await,
                 }
