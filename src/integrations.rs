@@ -429,10 +429,17 @@ pub fn mount_fs_integration<
                                     None,
                                 )
                                 .await;
-                            } else {
-                                target = header;
                             }
+                            target = header;
                         } else {
+                            if admin {
+                                return default_error_response(
+                                    StatusCode::UNAUTHORIZED,
+                                    host,
+                                    Some("you can't implicitly delete your account as admin"),
+                                )
+                                .await;
+                            }
                             target = &username;
                         }
 
