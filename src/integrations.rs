@@ -455,9 +455,18 @@ pub fn mount_fs_integration<
                             true
                         };
                         if allow {
-                            users.users.remove(target);
-
-                            FatResponse::no_cache(Response::new(Bytes::new()))
+                            let user = users.users.remove(target);
+                            if let Some((_, user)) = user {
+                                users.email_to_user.remove(&user.email);
+                                FatResponse::no_cache(Response::new(Bytes::new()))
+                            } else {
+                                default_error_response(
+                                    StatusCode::NOT_FOUND,
+                                    host,
+                                    Some("account not found"),
+                                )
+                                .await
+                            }
                         } else {
                             default_error_response(
                                 StatusCode::UNAUTHORIZED,
