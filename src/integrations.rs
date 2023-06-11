@@ -130,6 +130,13 @@ pub struct User<T> {
     hashed_password: u128,
     salt: [u8; 16],
 }
+impl<T> User<T> {
+    pub fn new_password(&mut self, password: &[u8]) {
+        let (hash, salt) = new_hash(password);
+        self.hashed_password = hash;
+        self.salt = salt;
+    }
+}
 #[derive(Deserialize, Serialize, Clone)]
 struct QueriedUser {
     pub username: CompactString,
@@ -193,6 +200,12 @@ impl<
         } else {
             false
         }
+    }
+    #[allow(clippy::result_unit_err)]
+    pub fn change_user_password(&self, username: &str, password: &[u8]) -> Result<(), ()> {
+        let mut u = self.users.get_mut(username).ok_or(())?;
+        u.new_password(password);
+        Ok(())
     }
 
     /// Change types of all data. Useful for "upgrading" the data scheme
@@ -317,11 +330,7 @@ pub fn mount_fs_integration<
                             return Validation::Unauthorized;
                         };
 
-                        let mut pass = Vec::with_capacity(password.len() + 16);
-                        pass.extend_from_slice(password.as_bytes());
-                        pass.extend_from_slice(&user.salt);
-
-                        let hash = xxhash_rust::xxh3::xxh3_128(&pass);
+                        let hash = password_hash(password.as_bytes(), &user.salt);
 
                         if user.hashed_password != hash {
                             return Validation::Unauthorized;
@@ -415,13 +424,7 @@ pub fn mount_fs_integration<
                             .await;
                         };
 
-                        let salt: [u8; 16] = rand::Rng::gen(&mut rand::thread_rng());
-
-                        let mut pass = Vec::with_capacity(body.password.len() + 16);
-                        pass.extend_from_slice(body.password.as_bytes());
-                        pass.extend_from_slice(&salt);
-
-                        let hash = xxhash_rust::xxh3::xxh3_128(&pass);
+                        let (hash, salt) = new_hash(body.password.as_bytes());
 
                         let user = User {
                             username: body.username.clone(),
@@ -587,4 +590,18 @@ pub fn mount_fs_integration<
         login: auth.login_status(),
         data: users,
     }
+}
+
+fn password_hash(password: &[u8], salt: &[u8]) -> u128 {
+    let mut pass = Vec::with_capacity(password.len() + salt.len());
+    pass.extend_from_slice(password);
+    pass.extend_from_slice(salt);
+
+    xxhash_rust::xxh3::xxh3_128(&pass)
+}
+fn new_hash(password: &[u8]) -> (u128, [u8; 16]) {
+    let salt: [u8; 16] = rand::Rng::gen(&mut rand::thread_rng());
+
+    let hash = password_hash(password, &salt);
+    (hash, salt)
 }
