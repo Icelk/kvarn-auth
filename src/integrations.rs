@@ -61,7 +61,10 @@ impl<
             Validation::Unauthorized => UserValidation::Unauthorized,
             Validation::Authorized(AuthData::Structured(v)) => {
                 let Some(user) = self.data.users.get(&v.username) else {
-                    warn!("User {} is authorized but doesn't exist in the DB", v.username);
+                    warn!(
+                        "User {} is authorized but doesn't exist in the DB",
+                        v.username
+                    );
                     return UserValidation::Unauthorized;
                 };
 
@@ -81,7 +84,10 @@ impl<
             Validation::Unauthorized => UserValidation::Unauthorized,
             Validation::Authorized(AuthData::Structured(v)) => {
                 let Some(user) = self.data.users.get_mut(&v.username) else {
-                    warn!("User {} is authorized but doesn't exist in the DB", v.username);
+                    warn!(
+                        "User {} is authorized but doesn't exist in the DB",
+                        v.username
+                    );
                     return UserValidation::Unauthorized;
                 };
 
@@ -391,13 +397,20 @@ pub fn mount_fs_integration<
                         }
                         let Ok(body) = req.body_mut().read_to_bytes(1024 * 8).await else {
                             return default_error_response(
-                                StatusCode::BAD_REQUEST, host, Some("requires JSON body")
-                            ).await;
+                                StatusCode::BAD_REQUEST,
+                                host,
+                                Some("requires JSON body"),
+                            )
+                            .await;
                         };
-                        let Ok(mut body): Result<CreationUser, _> = serde_json::from_slice(&body) else {
+                        let Ok(mut body): Result<CreationUser, _> = serde_json::from_slice(&body)
+                        else {
                             return default_error_response(
-                                StatusCode::BAD_REQUEST, host, Some("missing parameters")
-                            ).await;
+                                StatusCode::BAD_REQUEST,
+                                host,
+                                Some("missing parameters"),
+                            )
+                            .await;
                         };
 
                         body.email = body.email.to_lowercase().to_compact_string();
@@ -489,14 +502,13 @@ pub fn mount_fs_integration<
                         FatResponse::no_cache(Response::new(bytes.into_inner().freeze()))
                     }
                     Method::DELETE => {
-                        let Validation::Authorized(AuthData::Structured(
-                            LoginData {
-                                username,
-                                email,
-                                admin,
-                                ctime: _,
-                            },
-                        )) = login(req, addr) else {
+                        let Validation::Authorized(AuthData::Structured(LoginData {
+                            username,
+                            email,
+                            admin,
+                            ctime: _,
+                        })) = login(req, addr)
+                        else {
                             return default_error_response(StatusCode::UNAUTHORIZED, host, None)
                                 .await;
                         };
