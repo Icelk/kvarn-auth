@@ -43,6 +43,7 @@ but greatly decreases the risk of account theft. So probably use it for banking 
 # Versions
 
 -   0.1.x - `kvarn v0.5`
+-   0.2.x - `kvarn v0.6`
 
 # Example
 
