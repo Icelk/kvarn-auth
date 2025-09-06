@@ -17,7 +17,7 @@ base64 = "0.22"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 kvarn = { version = "0.6", path = "../kvarn", default-features = false }
 log = "0.4"
-rand = "0.9"
+rand = "0.8.5"
 
 # structured
 serde = { version = "1", optional = true }

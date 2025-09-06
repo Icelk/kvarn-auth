@@ -482,7 +482,7 @@ impl Validate for ValidationAlgo {
     }
 }
 #[cfg(any(feature = "rsa", feature = "ecdsa"))]
-impl<'a> Validate for &'a ValidationAlgo {
+impl Validate for &ValidationAlgo {
     #[allow(unused_variables)] // cfg
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         match *self {
@@ -511,7 +511,7 @@ impl Validate for ComputedAlgo {
         (&self).validate(data, signature, ip)
     }
 }
-impl<'a> Validate for &'a ComputedAlgo {
+impl Validate for &ComputedAlgo {
     #[allow(unused_variables)] // cfg
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         match *self {
@@ -562,7 +562,7 @@ impl Validate for Mode {
         (&self).validate(data, signature, ip)
     }
 }
-impl<'a> Validate for &'a Mode {
+impl Validate for &Mode {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         match *self {
             Mode::Sign(s) => s.validate(data, signature, ip),
@@ -720,7 +720,7 @@ impl<T: Serialize + DeserializeOwned> Validation<T> {
                 AuthData::TextNumber(s.to_owned(), n)
             }
             "s" => {
-                let serialize_v = payload.get("__deserialize_v").map_or(false, |v| v == true);
+                let serialize_v = payload.get("__deserialize_v").is_some_and(|v| v == true);
                 let v = if serialize_v {
                     or_unauthorized!(payload.get_mut("v")).take()
                 } else {
