@@ -55,7 +55,7 @@ impl<
         &self,
         request: &FatRequest,
         addr: SocketAddr,
-    ) -> UserValidation<dashmap::mapref::one::Ref<CompactString, User<T>>> {
+    ) -> UserValidation<dashmap::mapref::one::Ref<'_, CompactString, User<T>>> {
         let validation = (self.login)(request, addr);
         match validation {
             Validation::Unauthorized => UserValidation::Unauthorized,
@@ -78,7 +78,7 @@ impl<
         &self,
         request: &FatRequest,
         addr: SocketAddr,
-    ) -> UserValidation<dashmap::mapref::one::RefMut<CompactString, User<T>>> {
+    ) -> UserValidation<dashmap::mapref::one::RefMut<'_, CompactString, User<T>>> {
         let validation = (self.login)(request, addr);
         match validation {
             Validation::Unauthorized => UserValidation::Unauthorized,

@@ -572,7 +572,7 @@ impl Validate for &Mode {
     }
 }
 #[cfg(all(test, feature = "ecdsa"))]
-impl<'a> Validate for &'a [u8] {
+impl Validate for &[u8] {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         let signing = ecdsa_sk(self);
         let public_key = signing.verifying_key();
@@ -588,7 +588,7 @@ impl<'a> Validate for &'a [u8] {
     }
 }
 #[cfg(all(test, feature = "ecdsa"))]
-impl<'a, const LEN: usize> Validate for &'a [u8; LEN] {
+impl<const LEN: usize> Validate for &[u8; LEN] {
     fn validate(&self, data: &[u8], signature: &[u8], ip: Option<IpAddr>) -> Result<(), ()> {
         (&self[..]).validate(data, signature, ip)
     }
